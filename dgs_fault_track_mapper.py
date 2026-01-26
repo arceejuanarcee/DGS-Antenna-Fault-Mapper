@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 """
 DGS Fault & Track Mapper (CSV/XLSX/TXT) + Hover Tooltips
-— robust datetime parsing • safe track pairing • no full-day shading
+— robust datetime parsing • safe track pairing • NO full-day or long-window plotting
+
+UPDATE (per request):
+- Tracks are drawn as outline rectangles (no shaded background).
+- Any track window that is:
+    (a) full-day-ish (≈ 24h), OR
+    (b) longer than 20 minutes
+  is DISREGARDED and NOT PLOTTED.
+- We also filter AFTER merging overlaps so merged “tall borders” disappear.
 """
 
 import os
@@ -16,7 +24,7 @@ import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.patches import Patch
+from matplotlib.patches import Patch, Rectangle
 from matplotlib import cm
 
 # --- Optional hover tooltips
@@ -41,12 +49,16 @@ COL_START = ["start", "start_time", "begin", "window_start"]
 COL_END = ["end", "end_time", "finish", "window_end"]
 COL_SAT = ["satellite", "sat", "spacecraft", "sc", "target_name"]
 
-# max duration we accept for a track window (guards parsing mistakes)
+# max duration we accept for a track window during parsing/pairing (guards parsing mistakes)
 MAX_TRACK_MINUTES = 120  # 2 hours
 # if a start has no stop, we synthesize a short window
 SYNTH_WINDOW_MINUTES = 10
 # when pairing start→nearest stop, maximum gap to accept
 PAIR_MAX_GAP_MINUTES = 120
+
+# --- Plot filters (requested)
+MAX_PLOT_TRACK_MINUTES = 20          # disregard windows longer than this (NOT PLOTTED)
+FULL_DAY_EPS_MINUTES = 1             # treat within 1 minute of 24h as full-day-ish
 
 
 # ============================== Regexes =====================================
@@ -93,6 +105,7 @@ _EXPLICIT_DT_FORMATS = [
     "%H:%M:%S",
 ]
 
+
 def _strip_tz(x: pd.Series) -> pd.Series:
     try:
         return x.dt.tz_convert(None)
@@ -102,10 +115,12 @@ def _strip_tz(x: pd.Series) -> pd.Series:
         except Exception:
             return x
 
+
 def _fix_24h(s: pd.Series) -> pd.Series:
     if s.dtype == object:
         return s.str.replace(_TIME_24_RE, "23:59:59.999", regex=True)
     return s
+
 
 def parse_dt(series: pd.Series) -> pd.Series:
     raw = series.astype(str)
@@ -129,6 +144,7 @@ def parse_dt(series: pd.Series) -> pd.Series:
 
     return _strip_tz(out)
 
+
 def parse_date_time(date_s: pd.Series, time_s: pd.Series) -> pd.Series:
     combined = date_s.astype(str).str.strip() + " " + _fix_24h(time_s.astype(str)).str.strip()
     return parse_dt(combined)
@@ -145,10 +161,6 @@ def parse_txt_log(path: str) -> pd.DataFrame:
       start (string or None),
       end   (string or None),
       satellite (string or None)
-
-    IMPORTANT:
-    - Only explicit "Track: ... (start,end)" lines carry both start+end here.
-    - Standalone "track_start"/"track_stop" lines carry start OR end (not both).
     """
     rows = []
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -223,12 +235,10 @@ def _pair_starts_stops(track_rows: pd.DataFrame) -> pd.DataFrame:
       B) separate start-only and stop-only rows (pair within PAIR_MAX_GAP_MINUTES on same day)
       C) synthesize short window for unpaired starts
     """
-    # explicit windows
     explicit = track_rows[track_rows["dt_start"].notna() & track_rows["dt_end"].notna()][
         ["dt_start", "dt_end", "satellite"]
     ].copy()
 
-    # starts / stops
     starts = track_rows[track_rows["dt_start"].notna() & track_rows["dt_end"].isna()][
         ["dt_start", "satellite"]
     ].sort_values("dt_start").reset_index(drop=True)
@@ -242,7 +252,6 @@ def _pair_starts_stops(track_rows: pd.DataFrame) -> pd.DataFrame:
     for _, srow in starts.iterrows():
         s_dt = srow["dt_start"]
         s_day = s_dt.date()
-        # advance 'j' until stop >= start
         while j < len(stops) and stops.loc[j, "dt_end"] < s_dt:
             j += 1
         if j < len(stops):
@@ -253,7 +262,6 @@ def _pair_starts_stops(track_rows: pd.DataFrame) -> pd.DataFrame:
                 paired.append({"dt_start": s_dt, "dt_end": e_dt, "satellite": srow["satellite"]})
                 j += 1
                 continue
-        # no acceptable stop → synthesize a short window
         paired.append({
             "dt_start": s_dt,
             "dt_end": s_dt + pd.Timedelta(minutes=SYNTH_WINDOW_MINUTES),
@@ -275,7 +283,6 @@ def extract_events(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     df2 = df.copy()
     df2.rename(columns={c: c.strip() for c in df2.columns}, inplace=True)
 
-    # flexible cols
     type_col = first_col(df2, COL_TYPE)
     dt_col = first_col(df2, COL_DATETIME)
     date_col = first_col(df2, COL_DATE)
@@ -298,7 +305,6 @@ def extract_events(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     dt_start = parse_dt(df2[start_col]) if start_col else parse_dt(df2["start"]) if "start" in df2.columns else pd.Series(pd.NaT, index=df2.index, dtype="datetime64[ns]")
     dt_end   = parse_dt(df2[end_col])   if end_col   else parse_dt(df2["end"])   if "end"   in df2.columns else pd.Series(pd.NaT, index=df2.index, dtype="datetime64[ns]")
 
-    # fallback base timestamp from start if needed
     base_dt_mask = dt_series.isna() & dt_start.notna()
     dt_series.loc[base_dt_mask] = dt_start.loc[base_dt_mask]
 
@@ -357,28 +363,23 @@ def extract_events(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
     # ---- TRACKS (pair starts/stops + sanitize)
     tr_raw = base[base["etype"].isin(TRACK_LIKE | {"track"})][["dt", "dt_start", "dt_end", "satellite"]].copy()
-    # use dt as fallback start/end carriers for explicit rows that came via CSV
     tr_raw["dt_start"] = tr_raw["dt_start"].where(tr_raw["dt_start"].notna(), tr_raw["dt"])
-    # (leave dt_end as is; we only care when explicit)
     tracks = _pair_starts_stops(tr_raw)
 
     if tracks.empty:
         return faults, tracks
 
-    # y1/y2 and guardrails
     tracks["day_label"] = tracks["dt_start"].dt.strftime("%m-%d-%y")
     y1 = tracks["dt_start"].dt.hour + tracks["dt_start"].dt.minute.div(60)
     y2 = tracks["dt_end"].dt.hour + tracks["dt_end"].dt.minute.div(60)
 
-    # swap if reversed (shouldn't happen after pairing, but safe)
     swap = y2 < y1
     y1, y2 = y1.where(~swap, y2), y2.where(~swap, y1)
 
-    # clip to [0,24)
     y1 = y1.clip(lower=0, upper=23.999)
     y2 = y2.clip(lower=0.001, upper=24.0)
 
-    # drop “full day” looking windows (protect against bad parses)
+    # remove full-day-ish windows early
     keep = tracks["day_label"].notna() & (y2 > y1) & ~((y1 <= 0.001) & (y2 >= 23.999))
     tracks = tracks[keep].copy()
     tracks["y1"] = y1.loc[tracks.index]
@@ -393,9 +394,92 @@ def _color_map(keys: List[str]) -> Dict[str, tuple]:
     cmap = cm.get_cmap('tab20')
     return {k: cmap(i % 20) for i, k in enumerate(keys)}
 
-def plot_fault_map(faults_list: List[pd.DataFrame], tracks_list: List[pd.DataFrame], month_title: Optional[str] = None):
-    faults = pd.concat(faults_list, ignore_index=True) if faults_list else pd.DataFrame(columns=["day_label","hour_float","code_str","code_num","dt"])
-    tracks = pd.concat(tracks_list, ignore_index=True) if tracks_list else pd.DataFrame(columns=["day_label","y1","y2","satellite","dt_start","dt_end"])
+
+def _merge_overlaps_per_sat_day(tracks: pd.DataFrame) -> pd.DataFrame:
+    """
+    Merge overlapping/adjacent windows for same (day_label, satellite).
+    This reduces clutter and prevents stacked artifacts.
+    """
+    if tracks.empty:
+        return tracks
+
+    t = tracks.copy()
+    sat_series = t["satellite"].astype("string")
+    missing = sat_series.isna() | sat_series.str.strip().eq("") | sat_series.str.strip().str.lower().isin({"none", "nan"})
+    t["satellite"] = sat_series.mask(missing, np.nan)
+
+    out_rows = []
+    for (day, sat), grp in t.groupby(["day_label", "satellite"], dropna=False):
+        g = grp.sort_values(["y1", "y2"])
+        cur_y1 = None
+        cur_y2 = None
+        cur_idx = None
+
+        for _, r in g.iterrows():
+            y1 = float(r["y1"])
+            y2 = float(r["y2"])
+            if cur_y1 is None:
+                cur_y1, cur_y2 = y1, y2
+                cur_idx = r
+                continue
+
+            # overlap or touching (within 1 minute)
+            if y1 <= cur_y2 + (1/60):
+                cur_y2 = max(cur_y2, y2)
+            else:
+                row = cur_idx.copy()
+                row["y1"] = cur_y1
+                row["y2"] = cur_y2
+                out_rows.append(row)
+                cur_y1, cur_y2 = y1, y2
+                cur_idx = r
+
+        if cur_y1 is not None:
+            row = cur_idx.copy()
+            row["y1"] = cur_y1
+            row["y2"] = cur_y2
+            out_rows.append(row)
+
+    merged = pd.DataFrame(out_rows)
+    merged = merged.drop_duplicates(subset=["day_label", "satellite", "y1", "y2"])
+    return merged
+
+
+def _filter_tracks_for_plot(tracks: pd.DataFrame) -> pd.DataFrame:
+    """
+    DISREGARD & DO NOT PLOT:
+      - full-day-ish (≈24h) windows
+      - > MAX_PLOT_TRACK_MINUTES windows
+    """
+    if tracks.empty:
+        return tracks
+
+    dur_min = (tracks["y2"].astype(float) - tracks["y1"].astype(float)) * 60.0
+    full_day_min = 24.0 * 60.0
+
+    is_full_dayish = dur_min >= (full_day_min - FULL_DAY_EPS_MINUTES)
+    too_long = dur_min > MAX_PLOT_TRACK_MINUTES
+
+    keep = (~is_full_dayish) & (~too_long) & (dur_min > 0)
+    return tracks.loc[keep].copy()
+
+
+def plot_fault_map(
+    faults_list: List[pd.DataFrame],
+    tracks_list: List[pd.DataFrame],
+    month_title: Optional[str] = None
+):
+    faults = pd.concat(faults_list, ignore_index=True) if faults_list else pd.DataFrame(
+        columns=["day_label", "hour_float", "code_str", "code_num", "dt"]
+    )
+    tracks = pd.concat(tracks_list, ignore_index=True) if tracks_list else pd.DataFrame(
+        columns=["day_label", "y1", "y2", "satellite", "dt_start", "dt_end"]
+    )
+
+    # merge, then filter out long/full-day windows (so “tall borders” vanish)
+    if not tracks.empty:
+        tracks = _merge_overlaps_per_sat_day(tracks)
+        tracks = _filter_tracks_for_plot(tracks)
 
     unique_days = sorted(set(
         pd.Index(faults.get("day_label", pd.Series(dtype=str))).dropna().unique().tolist() +
@@ -410,16 +494,19 @@ def plot_fault_map(faults_list: List[pd.DataFrame], tracks_list: List[pd.DataFra
     track_handles = []
     fault_handles = []
 
-    # --- tracks
+    # --- tracks (outline-only rectangles; NO fill)
     if not tracks.empty and len(day_to_x) > 0:
         tr = tracks.copy()
+
         sat_series = tr["satellite"].astype("string")
-        missing = sat_series.isna() | sat_series.str.strip().eq("") | sat_series.str.strip().str.lower().isin({"none","nan"})
+        missing = sat_series.isna() | sat_series.str.strip().eq("") | sat_series.str.strip().str.lower().isin({"none", "nan"})
         tr["satellite"] = sat_series.mask(missing, np.nan)
 
         named = tr.dropna(subset=["satellite"])
         sats = sorted(named["satellite"].unique().tolist())
         cmap = _color_map(sats)
+
+        box_w = 0.70  # day column width (x±0.35)
 
         for sat in sats:
             grp = named[named["satellite"] == sat]
@@ -429,30 +516,57 @@ def plot_fault_map(faults_list: List[pd.DataFrame], tracks_list: List[pd.DataFra
                 if x is None or pd.isna(row["y1"]) or pd.isna(row["y2"]):
                     continue
                 y1, y2 = float(row["y1"]), float(row["y2"])
-                if y2 <= y1 or (y1 <= 0.001 and y2 >= 23.999):
+                if y2 <= y1:
                     continue
-                coll = ax.fill_between([x - 0.35, x + 0.35], y1, y2, color=color, alpha=0.18, zorder=1)
-                start_s = pd.to_datetime(row["dt_start"]).strftime("%H:%M")
-                end_s = pd.to_datetime(row["dt_end"]).strftime("%H:%M")
+
+                rect = Rectangle(
+                    (x - box_w / 2, y1),
+                    box_w,
+                    (y2 - y1),
+                    fill=False,
+                    edgecolor=color,
+                    linewidth=1.5,
+                    alpha=0.9,
+                    zorder=2,
+                )
+                ax.add_patch(rect)
+
+                # tooltips (best-effort; dt_start/dt_end may be missing after merges)
+                start_s = pd.to_datetime(row.get("dt_start")).strftime("%H:%M") if pd.notna(row.get("dt_start")) else f"{y1:0.2f}h"
+                end_s = pd.to_datetime(row.get("dt_end")).strftime("%H:%M") if pd.notna(row.get("dt_end")) else f"{y2:0.2f}h"
                 text = f"Track: {sat}\nDay: {row['day_label']}\nStart–End: {start_s}–{end_s}"
-                setattr(coll, "_hover_text", text)
-                hover_targets.append((coll, text, False))
+                setattr(rect, "_hover_text", text)
+                hover_targets.append((rect, text, False))
+
             track_handles.append(Patch(facecolor=color, alpha=0.25, label=sat))
 
+        # unnamed tracks (gray outline)
         unnamed = tr[tr["satellite"].isna()]
         for _, row in unnamed.iterrows():
             x = day_to_x.get(row["day_label"])
             if x is None or pd.isna(row["y1"]) or pd.isna(row["y2"]):
                 continue
             y1, y2 = float(row["y1"]), float(row["y2"])
-            if y2 <= y1 or (y1 <= 0.001 and y2 >= 23.999):
+            if y2 <= y1:
                 continue
-            coll = ax.fill_between([x - 0.35, x + 0.35], y1, y2, color=(0.5,0.5,0.5,1), alpha=0.12, zorder=1)
-            start_s = pd.to_datetime(row["dt_start"]).strftime("%H:%M")
-            end_s = pd.to_datetime(row["dt_end"]).strftime("%H:%M")
+
+            rect = Rectangle(
+                (x - box_w / 2, y1),
+                box_w,
+                (y2 - y1),
+                fill=False,
+                edgecolor=(0.5, 0.5, 0.5, 1),
+                linewidth=1.2,
+                alpha=0.8,
+                zorder=2,
+            )
+            ax.add_patch(rect)
+
+            start_s = pd.to_datetime(row.get("dt_start")).strftime("%H:%M") if pd.notna(row.get("dt_start")) else f"{y1:0.2f}h"
+            end_s = pd.to_datetime(row.get("dt_end")).strftime("%H:%M") if pd.notna(row.get("dt_end")) else f"{y2:0.2f}h"
             text = f"Track Window\nDay: {row['day_label']}\nStart–End: {start_s}–{end_s}"
-            setattr(coll, "_hover_text", text)
-            hover_targets.append((coll, text, False))
+            setattr(rect, "_hover_text", text)
+            hover_targets.append((rect, text, False))
 
     # --- faults
     if not faults.empty and len(day_to_x) > 0:
@@ -496,6 +610,7 @@ def plot_fault_map(faults_list: List[pd.DataFrame], tracks_list: List[pd.DataFra
             loc="upper center", bbox_to_anchor=(0.5, legend_y),
             ncol=min(6, max(1, len(all_h))), frameon=False
         )
+
     plt.subplots_adjust(bottom=0.28)
     plt.tight_layout()
 
@@ -510,11 +625,12 @@ def plot_fault_map(faults_list: List[pd.DataFrame], tracks_list: List[pd.DataFra
             if hasattr(art, "_hover_texts"):
                 idx = sel.index
                 texts = getattr(art, "_hover_texts", [])
-                sel.annotation.set_text(texts[idx] if idx is not None and 0 <= idx < len(texts) else art.get_label())
+                sel.annotation.set_text(texts[idx] if idx is not None and 0 <= idx < len(texts) else "Fault")
             elif hasattr(art, "_hover_text"):
                 sel.annotation.set_text(getattr(art, "_hover_text"))
             else:
-                sel.annotation.set_text(art.get_label())
+                sel.annotation.set_text("")
+
     return fig, ax
 
 
@@ -540,14 +656,18 @@ class App(tk.Tk):
         tk.Button(top, text="Save Plot", command=self.save_plot).pack(side=tk.LEFT, padx=5)
 
         self.listbox = tk.Listbox(self, height=6)
-        self.listbox.pack(fill=tk.X, padx=10, pady=(0,10))
+        self.listbox.pack(fill=tk.X, padx=10, pady=(0, 10))
 
-        self.fig, self.ax = plt.subplots(figsize=(12,6), dpi=120)
+        self.fig, self.ax = plt.subplots(figsize=(12, 6), dpi=120)
         self.canvas = FigureCanvasTkAgg(self.fig, master=self)
         self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
         if not MPLCURSORS_AVAILABLE:
-            tk.Label(self, text="Tip: install 'mplcursors' for hover tooltips:  pip install mplcursors", fg="gray").pack(pady=(0,8))
+            tk.Label(
+                self,
+                text="Tip: install 'mplcursors' for hover tooltips:  pip install mplcursors",
+                fg="gray"
+            ).pack(pady=(0, 8))
 
     def add_files(self):
         paths = filedialog.askopenfilenames(
@@ -583,10 +703,12 @@ class App(tk.Tk):
                 df = load_any(path)
                 f, t = extract_events(df)
                 if not f.empty:
-                    f = f.copy(); f["source"] = os.path.basename(path)
+                    f = f.copy()
+                    f["source"] = os.path.basename(path)
                     faults_all.append(f)
                 if not t.empty:
-                    t = t.copy(); t["source"] = os.path.basename(path)
+                    t = t.copy()
+                    t["source"] = os.path.basename(path)
                     tracks_all.append(t)
             except Exception as e:
                 errors.append(f"{os.path.basename(path)}: {e}")
