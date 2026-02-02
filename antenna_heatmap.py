@@ -1,34 +1,29 @@
 #!/usr/bin/env python3
 """
-Antenna Fault Heat Map (Az/El) — GUI
+Antenna Fault Heatmap GUI (Az/El Skyplot)
+- User selects a root folder that contains:
+    root/
+      Events/   -> Events_YYYY-MM-DD_*.log.txt
+      Metrics/  -> Metrics_YYYY-MM-DD_*.log.csv
+- User selects Year, Month (All or specific), Day (All or specific)
+- Script auto-loads matching files, matches events -> nearest metrics az/el, and plots:
+    - heatmap (fault density in az/el bins)
+    - fault points
+    - motion track (optional)
 
-Features
-- Load METRICS CSV (time series) and EVENTS TXT (log lines)
-- Auto-detect azimuth/elevation/time columns when possible
-- Choose/override column mappings via dropdowns
-- Plot:
-  - Motion track (from metrics)
-  - Fault points (from events and/or metrics)
-  - Heat map of fault density over az/el bins
-- Filter by time range and by fault keyword(s)
-- Export plot as PNG
-
-Install
-  pip install numpy pandas matplotlib
-
-Run
+Install:
+  pip install pandas numpy matplotlib
+Run:
   python antenna_fault_heatmap_gui.py
 """
 
 from __future__ import annotations
 
-import os
 import re
-import sys
-import math
-import datetime as dt
 from dataclasses import dataclass
-from typing import Optional, List, Tuple, Dict
+from pathlib import Path
+from datetime import datetime, timedelta
+from typing import Optional, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -42,288 +37,325 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 
-# ----------------------------
+# =========================
+# CONFIG (defaults)
+# =========================
+
+MATCH_TOLERANCE_SEC = 5   # events must be within this many seconds of a metrics row
+AZ_BINS_DEG = 5           # heatmap az bin width
+EL_BINS_DEG = 5           # heatmap el bin width
+
+# Fault detection: treat events whose message begins with one of these as a "fault"
+FAULT_PREFIXES = (
+    "Fault:",
+    "FAULT:",
+    "Alarm:",
+    "ALARM:",
+    "Error:",
+    "ERROR:",
+    "Motion: Axis error",
+)
+
+# Filename patterns
+# Metrics_2025-12-19_00-00-00.log.csv
+# Events_2025-12-19_00-29-31.log.txt
+METRICS_RE = re.compile(r"^Metrics_(\d{4}-\d{2}-\d{2})_\d{2}-\d{2}-\d{2}\.log\.csv$", re.IGNORECASE)
+EVENTS_RE  = re.compile(r"^Events_(\d{4}-\d{2}-\d{2})_\d{2}-\d{2}-\d{2}\.log\.txt$", re.IGNORECASE)
+
+# Events line pattern:
+# 2025-12-19 06:05:59.638,Fault: ...
+EVENT_LINE_RE = re.compile(
+    r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d{1,6})?),\s*(?P<msg>.*)$"
+)
+
+
+# =========================
 # Helpers
-# ----------------------------
+# =========================
 
-def _safe_float(x) -> Optional[float]:
-    try:
-        if pd.isna(x):
-            return None
-        return float(x)
-    except Exception:
-        return None
-
-def _normalize_az(az_deg: float) -> float:
-    # Keep [0, 360)
-    return az_deg % 360.0
-
-def _clamp(x, lo, hi):
-    return max(lo, min(hi, x))
-
-def _try_parse_datetime_series(s: pd.Series) -> Optional[pd.Series]:
-    # Try a few common datetime parses
-    for infer in (True, False):
-        try:
-            out = pd.to_datetime(s, errors="coerce", infer_datetime_format=infer, utc=False)
-            if out.notna().sum() >= max(3, int(0.2 * len(s))):
-                return out
-        except Exception:
-            continue
-    return None
-
-def _auto_pick_col(cols: List[str], candidates: List[str]) -> Optional[str]:
-    cols_l = [c.lower() for c in cols]
-    for cand in candidates:
-        for i, c in enumerate(cols_l):
-            if cand in c:
-                return cols[i]
-    return None
-
-def _parse_events_txt(path: str) -> pd.DataFrame:
-    """
-    Parse a TXT log into a DataFrame with columns:
-      time (datetime64[ns] or NaT),
-      az (float or NaN),
-      el (float or NaN),
-      label (str)
-
-    It attempts to parse lines that look like:
-      2026-01-23 10:35:12 ... AZ=123.4 EL=56.7 FAULT=OVERLOAD
-      2026/01/23 10:35:12 ... az: 123.4 elev: 56.7 alarm: X
-      2026-01-23T10:35:12Z ... Azimuth 123.4 Elevation 56.7 ...
-    """
-    # Date/time patterns (loose)
-    dt_patterns = [
-        r"(?P<ts>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})",
-        r"(?P<ts>\d{4}/\d{2}/\d{2}[ T]\d{2}:\d{2}:\d{2})",
-        r"(?P<ts>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2})",
-        r"(?P<ts>\d{4}/\d{2}/\d{2}[ T]\d{2}:\d{2})",
-    ]
-
-    # Az/El patterns (very loose)
-    az_patterns = [
-        r"(?:\bAZ\b|\bazimuth\b)\s*[:=]?\s*(?P<az>-?\d+(?:\.\d+)?)",
-        r"\baz\s*[:=]\s*(?P<az>-?\d+(?:\.\d+)?)",
-    ]
-    el_patterns = [
-        r"(?:\bEL\b|\belev(?:ation)?\b)\s*[:=]?\s*(?P<el>-?\d+(?:\.\d+)?)",
-        r"\bel\s*[:=]\s*(?P<el>-?\d+(?:\.\d+)?)",
-    ]
-
-    # Fault label patterns
-    label_patterns = [
-        r"(?:\bFAULT\b|\bALARM\b|\bERROR\b)\s*[:=]?\s*(?P<label>[A-Za-z0-9_\-./ ]+)",
-        r"(?:\bcode\b|\bid\b)\s*[:=]?\s*(?P<label>[A-Za-z0-9_\-./ ]+)",
-    ]
-
-    compiled_dt = [re.compile(p) for p in dt_patterns]
-    compiled_az = [re.compile(p, flags=re.IGNORECASE) for p in az_patterns]
-    compiled_el = [re.compile(p, flags=re.IGNORECASE) for p in el_patterns]
-    compiled_label = [re.compile(p, flags=re.IGNORECASE) for p in label_patterns]
-
-    rows = []
-    with open(path, "r", errors="ignore") as f:
-        for line in f:
-            raw = line.strip()
-            if not raw:
-                continue
-
-            ts = None
-            for rdt in compiled_dt:
-                m = rdt.search(raw)
-                if m:
-                    ts = m.group("ts")
-                    break
-
-            az = None
-            for raz in compiled_az:
-                m = raz.search(raw)
-                if m:
-                    az = _safe_float(m.group("az"))
-                    break
-
-            el = None
-            for rel in compiled_el:
-                m = rel.search(raw)
-                if m:
-                    el = _safe_float(m.group("el"))
-                    break
-
-            label = None
-            for rlb in compiled_label:
-                m = rlb.search(raw)
-                if m:
-                    label = m.group("label").strip()
-                    break
-
-            if label is None:
-                # If no explicit label, use a short snippet (still useful for filtering)
-                label = raw[:80]
-
-            rows.append({"time_raw": ts, "az": az, "el": el, "label": label, "line": raw})
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-
-    if "time_raw" in df.columns:
-        df["time"] = pd.to_datetime(df["time_raw"], errors="coerce", infer_datetime_format=True)
-    else:
-        df["time"] = pd.NaT
-
-    # Normalize
-    df["az"] = df["az"].astype(float)
-    df["el"] = df["el"].astype(float)
-
-    return df
-
+def _parse_dt(s: str) -> datetime:
+    # supports optional fractional seconds
+    if "." in s:
+        main, frac = s.split(".", 1)
+        frac = (frac + "000000")[:6]
+        base = datetime.strptime(main, "%Y-%m-%d %H:%M:%S")
+        return base.replace(microsecond=int(frac))
+    return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
 
 def _to_polar_r(el_deg: float) -> float:
-    """
-    Convert elevation degrees to polar radius for a 'sky plot' style:
-      - Center = zenith (el=90) -> r=0
-      - Outer ring = horizon (el=0) -> r=90
-    """
+    # center=zenith (90), outer=horizon (0)
     return 90.0 - el_deg
 
+def _date_range_from_selection(year: int, month: str, day: str) -> Tuple[datetime, datetime]:
+    """
+    month: "All" or "01".."12"
+    day: "All" or "01".."31"
+    returns [start, end)
+    """
+    if month == "All":
+        return datetime(year, 1, 1), datetime(year + 1, 1, 1)
 
-# ----------------------------
-# GUI App
-# ----------------------------
+    m = int(month)
+    if day == "All":
+        start = datetime(year, m, 1)
+        end = datetime(year + 1, 1, 1) if m == 12 else datetime(year, m + 1, 1)
+        return start, end
+
+    d = int(day)
+    start = datetime(year, m, d)
+    return start, start + timedelta(days=1)
+
+def _is_fault_message(msg: str) -> bool:
+    return any(msg.startswith(pfx) for pfx in FAULT_PREFIXES)
+
+def _find_files_in_range(metrics_dir: Path, events_dir: Path, start: datetime, end: datetime) -> Tuple[List[Path], List[Path]]:
+    metrics_files: List[Path] = []
+    events_files: List[Path] = []
+
+    if metrics_dir.exists():
+        for p in metrics_dir.iterdir():
+            m = METRICS_RE.match(p.name)
+            if not m:
+                continue
+            d = datetime.strptime(m.group(1), "%Y-%m-%d")
+            if start <= d < end:
+                metrics_files.append(p)
+
+    if events_dir.exists():
+        for p in events_dir.iterdir():
+            m = EVENTS_RE.match(p.name)
+            if not m:
+                continue
+            d = datetime.strptime(m.group(1), "%Y-%m-%d")
+            if start <= d < end:
+                events_files.append(p)
+
+    metrics_files.sort()
+    events_files.sort()
+    return metrics_files, events_files
+
+def _list_available_years(metrics_dir: Path, events_dir: Path) -> List[int]:
+    years = set()
+
+    if metrics_dir.exists():
+        for p in metrics_dir.iterdir():
+            m = METRICS_RE.match(p.name)
+            if m:
+                years.add(int(m.group(1)[:4]))
+
+    if events_dir.exists():
+        for p in events_dir.iterdir():
+            m = EVENTS_RE.match(p.name)
+            if m:
+                years.add(int(m.group(1)[:4]))
+
+    return sorted(years)
+
+def _list_available_dates_for_year(metrics_dir: Path, events_dir: Path, year: int) -> List[str]:
+    dates = set()
+
+    if metrics_dir.exists():
+        for p in metrics_dir.iterdir():
+            m = METRICS_RE.match(p.name)
+            if m and m.group(1).startswith(f"{year:04d}-"):
+                dates.add(m.group(1))
+
+    if events_dir.exists():
+        for p in events_dir.iterdir():
+            m = EVENTS_RE.match(p.name)
+            if m and m.group(1).startswith(f"{year:04d}-"):
+                dates.add(m.group(1))
+
+    return sorted(dates)
+
+def _load_metrics_csv(path: Path) -> pd.DataFrame:
+    """
+    Metrics CSV may have junk lines before the real CSV header.
+    We find the first row that starts with "Time" and read from there.
+    Required columns:
+      Time
+      Antenna azimuth (deg)
+      Antenna elevation (deg)
+    """
+    lines = path.read_text(encoding="utf-8", errors="ignore").splitlines(True)
+
+    header_idx = None
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if s.startswith('"Time"') or s.startswith("Time,") or s.startswith("Time\t"):
+            header_idx = i
+            break
+    if header_idx is None:
+        raise ValueError(f"Metrics file has no CSV header row starting with Time: {path.name}")
+
+    csv_text = "".join(lines[header_idx:])
+    df = pd.read_csv(pd.io.common.StringIO(csv_text), engine="python")
+    df.columns = [c.strip().strip('"') for c in df.columns]
+
+    needed = {"Time", "Antenna azimuth (deg)", "Antenna elevation (deg)"}
+    missing = needed - set(df.columns)
+    if missing:
+        raise ValueError(f"{path.name} missing columns: {sorted(missing)}")
+
+    df["Time"] = pd.to_datetime(df["Time"], errors="coerce")
+    df["Antenna azimuth (deg)"] = pd.to_numeric(df["Antenna azimuth (deg)"], errors="coerce")
+    df["Antenna elevation (deg)"] = pd.to_numeric(df["Antenna elevation (deg)"], errors="coerce")
+
+    df = df.dropna(subset=["Time", "Antenna azimuth (deg)", "Antenna elevation (deg)"])
+    df = df.sort_values("Time")
+
+    df["Antenna azimuth (deg)"] = df["Antenna azimuth (deg)"] % 360.0
+    df["Antenna elevation (deg)"] = df["Antenna elevation (deg)"].clip(lower=0.0, upper=90.0)
+
+    return df[["Time", "Antenna azimuth (deg)", "Antenna elevation (deg)"]].reset_index(drop=True)
 
 @dataclass
-class DataState:
-    metrics_path: Optional[str] = None
-    events_path: Optional[str] = None
-    df_metrics: Optional[pd.DataFrame] = None
-    df_events: Optional[pd.DataFrame] = None
+class EventRow:
+    time: datetime
+    msg: str
+
+def _load_events_txt(path: Path) -> List[EventRow]:
+    out: List[EventRow] = []
+    with path.open("r", encoding="utf-8", errors="ignore") as f:
+        for raw in f:
+            line = raw.strip()
+            m = EVENT_LINE_RE.match(line)
+            if not m:
+                continue
+            ts = _parse_dt(m.group("ts"))
+            msg = m.group("msg").strip()
+            out.append(EventRow(ts, msg))
+    return out
+
+def _build_fault_points(metrics: pd.DataFrame, events: List[EventRow], tolerance_sec: int) -> pd.DataFrame:
+    """
+    Match each fault event to nearest metrics timestamp using merge_asof.
+    Returns DataFrame columns:
+      Time_event, msg, Time_metrics, az_deg, el_deg
+    """
+    if metrics.empty:
+        return pd.DataFrame(columns=["Time_event", "msg", "Time_metrics", "az_deg", "el_deg"])
+
+    fault_events = [(e.time, e.msg) for e in events if _is_fault_message(e.msg)]
+    if not fault_events:
+        return pd.DataFrame(columns=["Time_event", "msg", "Time_metrics", "az_deg", "el_deg"])
+
+    df_ev = pd.DataFrame(fault_events, columns=["Time_event", "msg"]).sort_values("Time_event")
+    df_met = metrics.rename(columns={
+        "Time": "Time_metrics",
+        "Antenna azimuth (deg)": "az_deg",
+        "Antenna elevation (deg)": "el_deg",
+    }).sort_values("Time_metrics")
+
+    merged = pd.merge_asof(
+        df_ev,
+        df_met,
+        left_on="Time_event",
+        right_on="Time_metrics",
+        direction="nearest",
+        tolerance=pd.Timedelta(seconds=tolerance_sec)
+    )
+    merged = merged.dropna(subset=["Time_metrics", "az_deg", "el_deg"]).reset_index(drop=True)
+    return merged
+
+
+# =========================
+# GUI App
+# =========================
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Antenna Fault Heat Map (Az/El) — Sky Plot")
+        self.title("Antenna Fault Heat Map (Az/El) — Auto Match Events ↔ Metrics")
         self.geometry("1200x780")
 
-        self.state = DataState()
+        self.root_dir: Optional[Path] = None
+        self.events_dir: Optional[Path] = None
+        self.metrics_dir: Optional[Path] = None
 
-        # Selected column mappings
-        self.metrics_time_col = tk.StringVar(value="")
-        self.metrics_az_col = tk.StringVar(value="")
-        self.metrics_el_col = tk.StringVar(value="")
-        self.metrics_fault_col = tk.StringVar(value="")  # optional (e.g., status/fault code)
+        self.year_var = tk.StringVar(value="")
+        self.month_var = tk.StringVar(value="All")
+        self.day_var = tk.StringVar(value="All")
 
-        self.events_use = tk.BooleanVar(value=True)
-        self.metrics_fault_use = tk.BooleanVar(value=False)
+        self.show_track_var = tk.BooleanVar(value=True)
+        self.show_fault_points_var = tk.BooleanVar(value=True)
+        self.show_heatmap_var = tk.BooleanVar(value=True)
 
-        # Filters
-        self.filter_keywords = tk.StringVar(value="")  # comma-separated
-        self.tmin_str = tk.StringVar(value="")
-        self.tmax_str = tk.StringVar(value="")
+        self.tolerance_var = tk.IntVar(value=MATCH_TOLERANCE_SEC)
+        self.az_bin_var = tk.DoubleVar(value=AZ_BINS_DEG)
+        self.el_bin_var = tk.DoubleVar(value=EL_BINS_DEG)
 
-        # Binning
-        self.az_bin_deg = tk.DoubleVar(value=5.0)
-        self.el_bin_deg = tk.DoubleVar(value=5.0)
-
-        # Plot toggles
-        self.show_track = tk.BooleanVar(value=True)
-        self.show_fault_points = tk.BooleanVar(value=True)
-        self.show_heatmap = tk.BooleanVar(value=True)
+        self.status_var = tk.StringVar(value="Select root folder that contains Events/ and Metrics/.")
 
         self._build_ui()
         self._build_plot()
 
-    # ---------- UI ----------
     def _build_ui(self):
         outer = ttk.Frame(self, padding=10)
         outer.pack(fill="both", expand=True)
 
-        # Left controls
         left = ttk.Frame(outer)
         left.pack(side="left", fill="y")
 
-        # Right plot
         right = ttk.Frame(outer)
         right.pack(side="right", fill="both", expand=True)
 
-        # File loaders
-        lf_files = ttk.LabelFrame(left, text="1) Load Data", padding=10)
-        lf_files.pack(fill="x", pady=(0, 10))
+        # Folder selector
+        lf_folder = ttk.LabelFrame(left, text="1) Select Root Folder", padding=10)
+        lf_folder.pack(fill="x", pady=(0, 10))
 
-        ttk.Button(lf_files, text="Load Metrics CSV", command=self.load_metrics).pack(fill="x")
-        self.lbl_metrics = ttk.Label(lf_files, text="(no metrics loaded)")
-        self.lbl_metrics.pack(fill="x", pady=(4, 8))
+        ttk.Button(lf_folder, text="Choose Root Folder", command=self.choose_root_folder).pack(fill="x")
+        self.folder_label = ttk.Label(lf_folder, text="(none)")
+        self.folder_label.pack(fill="x", pady=(6, 0))
 
-        ttk.Button(lf_files, text="Load Events TXT", command=self.load_events).pack(fill="x")
-        self.lbl_events = ttk.Label(lf_files, text="(no events loaded)")
-        self.lbl_events.pack(fill="x", pady=(4, 0))
+        # Date selector
+        lf_date = ttk.LabelFrame(left, text="2) Date Selection", padding=10)
+        lf_date.pack(fill="x", pady=(0, 10))
 
-        # Column mapping
-        lf_cols = ttk.LabelFrame(left, text="2) Column Mapping (Metrics CSV)", padding=10)
-        lf_cols.pack(fill="x", pady=(0, 10))
+        ttk.Label(lf_date, text="Year:").pack(anchor="w")
+        self.year_cb = ttk.Combobox(lf_date, textvariable=self.year_var, state="readonly", values=[])
+        self.year_cb.pack(fill="x", pady=(0, 6))
+        self.year_cb.bind("<<ComboboxSelected>>", lambda e: self.refresh_month_day_options())
 
-        self.cmb_time = ttk.Combobox(lf_cols, textvariable=self.metrics_time_col, state="readonly", values=[])
-        self.cmb_az = ttk.Combobox(lf_cols, textvariable=self.metrics_az_col, state="readonly", values=[])
-        self.cmb_el = ttk.Combobox(lf_cols, textvariable=self.metrics_el_col, state="readonly", values=[])
-        self.cmb_fault = ttk.Combobox(lf_cols, textvariable=self.metrics_fault_col, state="readonly", values=[])
+        ttk.Label(lf_date, text="Month:").pack(anchor="w")
+        self.month_cb = ttk.Combobox(lf_date, textvariable=self.month_var, state="readonly",
+                                     values=["All"] + [f"{i:02d}" for i in range(1, 13)])
+        self.month_cb.pack(fill="x", pady=(0, 6))
+        self.month_cb.bind("<<ComboboxSelected>>", lambda e: self.refresh_month_day_options())
 
-        ttk.Label(lf_cols, text="Time column:").pack(anchor="w")
-        self.cmb_time.pack(fill="x", pady=(0, 6))
+        ttk.Label(lf_date, text="Day:").pack(anchor="w")
+        self.day_cb = ttk.Combobox(lf_date, textvariable=self.day_var, state="readonly", values=["All"])
+        self.day_cb.pack(fill="x", pady=(0, 2))
 
-        ttk.Label(lf_cols, text="Azimuth column (deg):").pack(anchor="w")
-        self.cmb_az.pack(fill="x", pady=(0, 6))
+        # Plot options
+        lf_opts = ttk.LabelFrame(left, text="3) Plot Options", padding=10)
+        lf_opts.pack(fill="x", pady=(0, 10))
 
-        ttk.Label(lf_cols, text="Elevation column (deg):").pack(anchor="w")
-        self.cmb_el.pack(fill="x", pady=(0, 6))
+        ttk.Checkbutton(lf_opts, text="Show motion track (from Metrics)", variable=self.show_track_var).pack(anchor="w")
+        ttk.Checkbutton(lf_opts, text="Show fault points", variable=self.show_fault_points_var).pack(anchor="w")
+        ttk.Checkbutton(lf_opts, text="Show heat map", variable=self.show_heatmap_var).pack(anchor="w")
 
-        ttk.Label(lf_cols, text="Fault/status column (optional):").pack(anchor="w")
-        self.cmb_fault.pack(fill="x", pady=(0, 2))
+        row = ttk.Frame(lf_opts)
+        row.pack(fill="x", pady=(8, 0))
+        ttk.Label(row, text="Match tol (sec):").pack(side="left")
+        ttk.Entry(row, textvariable=self.tolerance_var, width=6).pack(side="left", padx=6)
 
-        # Data source toggles
-        lf_src = ttk.LabelFrame(left, text="3) Fault Sources", padding=10)
-        lf_src.pack(fill="x", pady=(0, 10))
-
-        ttk.Checkbutton(lf_src, text="Use Events TXT (fault points)", variable=self.events_use).pack(anchor="w")
-        ttk.Checkbutton(lf_src, text="Use Metrics fault column (points where fault!=0/blank)", variable=self.metrics_fault_use).pack(anchor="w")
-
-        # Filters
-        lf_filter = ttk.LabelFrame(left, text="4) Filters", padding=10)
-        lf_filter.pack(fill="x", pady=(0, 10))
-
-        ttk.Label(lf_filter, text="Fault keywords (comma-separated, optional):").pack(anchor="w")
-        ttk.Entry(lf_filter, textvariable=self.filter_keywords).pack(fill="x", pady=(0, 6))
-
-        ttk.Label(lf_filter, text="Time min (optional, e.g., 2026-01-23 10:00):").pack(anchor="w")
-        ttk.Entry(lf_filter, textvariable=self.tmin_str).pack(fill="x", pady=(0, 6))
-
-        ttk.Label(lf_filter, text="Time max (optional):").pack(anchor="w")
-        ttk.Entry(lf_filter, textvariable=self.tmax_str).pack(fill="x", pady=(0, 2))
-
-        # Binning & plot options
-        lf_plot = ttk.LabelFrame(left, text="5) Plot Options", padding=10)
-        lf_plot.pack(fill="x", pady=(0, 10))
-
-        row1 = ttk.Frame(lf_plot)
-        row1.pack(fill="x")
-        ttk.Label(row1, text="Az bin (deg):").pack(side="left")
-        ttk.Entry(row1, textvariable=self.az_bin_deg, width=8).pack(side="left", padx=6)
-        ttk.Label(row1, text="El bin (deg):").pack(side="left")
-        ttk.Entry(row1, textvariable=self.el_bin_deg, width=8).pack(side="left", padx=6)
-
-        ttk.Checkbutton(lf_plot, text="Show motion track", variable=self.show_track).pack(anchor="w", pady=(8, 0))
-        ttk.Checkbutton(lf_plot, text="Show fault points", variable=self.show_fault_points).pack(anchor="w")
-        ttk.Checkbutton(lf_plot, text="Show heat map", variable=self.show_heatmap).pack(anchor="w")
+        row2 = ttk.Frame(lf_opts)
+        row2.pack(fill="x", pady=(6, 0))
+        ttk.Label(row2, text="Az bin (deg):").pack(side="left")
+        ttk.Entry(row2, textvariable=self.az_bin_var, width=6).pack(side="left", padx=6)
+        ttk.Label(row2, text="El bin (deg):").pack(side="left")
+        ttk.Entry(row2, textvariable=self.el_bin_var, width=6).pack(side="left", padx=6)
 
         # Actions
-        lf_actions = ttk.LabelFrame(left, text="6) Actions", padding=10)
+        lf_actions = ttk.LabelFrame(left, text="4) Actions", padding=10)
         lf_actions.pack(fill="x", pady=(0, 10))
 
-        ttk.Button(lf_actions, text="Update Plot", command=self.update_plot).pack(fill="x")
+        ttk.Button(lf_actions, text="Load + Plot", command=self.load_and_plot).pack(fill="x")
         ttk.Button(lf_actions, text="Export PNG", command=self.export_png).pack(fill="x", pady=(6, 0))
 
         # Status
-        self.status = ttk.Label(left, text="Load metrics and/or events, then Update Plot.", wraplength=340)
-        self.status.pack(fill="x", pady=(6, 0))
+        ttk.Label(left, textvariable=self.status_var, wraplength=340).pack(fill="x", pady=(6, 0))
 
         # Plot container
         self.plot_frame = ttk.Frame(right)
@@ -336,335 +368,201 @@ class App(tk.Tk):
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.plot_frame)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
 
-        self._style_polar_axes()
+        self._style_axes()
         self.canvas.draw()
 
-    def _style_polar_axes(self):
+    def _style_axes(self):
         ax = self.ax
         ax.clear()
-
-        # Polar: theta=azimuth, r=90-el
         ax.set_theta_zero_location("N")
-        ax.set_theta_direction(-1)  # clockwise: E at right
-
-        # Elevation rings: r = 90-el
-        # r=0 => el=90, r=90 => el=0
+        ax.set_theta_direction(-1)     # clockwise; E right
         ax.set_rlim(0, 90)
 
-        # Ring labels in elevation degrees (convert r->el)
         rings = [0, 15, 30, 45, 60, 75, 90]
         ax.set_yticks(rings)
-        ax.set_yticklabels([f"{int(90-r)}°" for r in rings])  # label as elevation
-
-        ax.set_title("Antenna Az/El Fault Heat Map (Sky Plot)", pad=18)
-
-        # Light grid
+        ax.set_yticklabels([f"{int(90-r)}°" for r in rings])  # elevation labels
         ax.grid(True, alpha=0.35)
+        ax.set_title("Antenna Fault Heat Map (Az/El Sky Plot)", pad=18)
 
-    # ---------- Data loading ----------
-    def load_metrics(self):
-        path = filedialog.askopenfilename(
-            title="Select metrics CSV",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
-        )
-        if not path:
+    # -------------
+    # Folder + date
+    # -------------
+    def choose_root_folder(self):
+        folder = filedialog.askdirectory(title="Select ROOT folder that contains Events/ and Metrics/")
+        if not folder:
             return
 
-        try:
-            df = pd.read_csv(path)
-        except Exception as e:
-            messagebox.showerror("Load failed", f"Could not read CSV:\n{e}")
+        root = Path(folder)
+        events = root / "Events"
+        metrics = root / "Metrics"
+
+        if not events.exists() or not metrics.exists():
+            messagebox.showerror(
+                "Folder structure not found",
+                "Your selected root folder must contain:\n"
+                "  Events\\  (txt logs)\n"
+                "  Metrics\\ (csv logs)\n\n"
+                f"Selected: {root}"
+            )
             return
 
-        if df.empty:
-            messagebox.showwarning("Empty", "CSV loaded but it is empty.")
+        self.root_dir = root
+        self.events_dir = events
+        self.metrics_dir = metrics
+        self.folder_label.config(text=str(root))
+
+        years = _list_available_years(metrics, events)
+        if not years:
+            self.year_cb["values"] = []
+            self.year_var.set("")
+            self.status_var.set("No matching Metrics_/Events_ files found in those folders.")
             return
 
-        self.state.metrics_path = path
-        self.state.df_metrics = df
+        self.year_cb["values"] = [str(y) for y in years]
+        self.year_var.set(str(years[-1]))  # default most recent year
+        self.refresh_month_day_options()
 
-        self.lbl_metrics.config(text=os.path.basename(path))
+        self.status_var.set("Folder ok. Choose Year/Month/Day then click Load + Plot.")
 
-        cols = list(df.columns)
-        self.cmb_time["values"] = cols
-        self.cmb_az["values"] = cols
-        self.cmb_el["values"] = cols
-        self.cmb_fault["values"] = [""] + cols
-
-        # Auto-detect
-        time_guess = _auto_pick_col(cols, ["time", "timestamp", "datetime", "date"])
-        az_guess = _auto_pick_col(cols, ["az", "azimuth"])
-        el_guess = _auto_pick_col(cols, ["el", "elev", "elevation"])
-
-        fault_guess = _auto_pick_col(cols, ["fault", "alarm", "error", "status", "code"])
-
-        self.metrics_time_col.set(time_guess or cols[0])
-        self.metrics_az_col.set(az_guess or "")
-        self.metrics_el_col.set(el_guess or "")
-        self.metrics_fault_col.set(fault_guess or "")
-
-        self.status.config(text="Metrics loaded. Verify column mappings, then load events or Update Plot.")
-
-    def load_events(self):
-        path = filedialog.askopenfilename(
-            title="Select events TXT",
-            filetypes=[("Text files", "*.txt"), ("Log files", "*.log"), ("All files", "*.*")]
-        )
-        if not path:
+    def refresh_month_day_options(self):
+        if not (self.metrics_dir and self.events_dir):
+            return
+        if not self.year_var.get().isdigit():
             return
 
-        try:
-            df = _parse_events_txt(path)
-        except Exception as e:
-            messagebox.showerror("Load failed", f"Could not parse TXT:\n{e}")
+        year = int(self.year_var.get())
+        dates = _list_available_dates_for_year(self.metrics_dir, self.events_dir, year)
+
+        # Day dropdown depends on month selection
+        month = self.month_var.get()
+
+        valid_days = set()
+        if month == "All":
+            # day can be All only (or we could allow 01..31 but it’s ambiguous without month)
+            self.day_cb["values"] = ["All"]
+            self.day_var.set("All")
             return
 
-        self.state.events_path = path
-        self.state.df_events = df
-        self.lbl_events.config(text=os.path.basename(path))
-        self.status.config(text="Events loaded. Update Plot when ready.")
+        # If month fixed, list available days in that month
+        for d in dates:
+            if d[5:7] == month:
+                valid_days.add(d[8:10])
 
-    # ---------- Filtering ----------
-    def _parse_tmin_tmax(self) -> Tuple[Optional[pd.Timestamp], Optional[pd.Timestamp]]:
-        tmin = self.tmin_str.get().strip()
-        tmax = self.tmax_str.get().strip()
-        tmin_ts = None
-        tmax_ts = None
+        day_values = ["All"] + sorted(valid_days)
+        self.day_cb["values"] = day_values
+        if self.day_var.get() not in day_values:
+            self.day_var.set("All")
 
-        if tmin:
+    # -------------
+    # Load + plot
+    # -------------
+    def load_and_plot(self):
+        if not (self.metrics_dir and self.events_dir):
+            messagebox.showwarning("Missing folder", "Please choose the root folder first.")
+            return
+        if not self.year_var.get().isdigit():
+            messagebox.showwarning("Missing year", "Please select a year.")
+            return
+
+        year = int(self.year_var.get())
+        month = self.month_var.get()
+        day = self.day_var.get()
+
+        start, end = _date_range_from_selection(year, month, day)
+
+        metrics_files, events_files = _find_files_in_range(self.metrics_dir, self.events_dir, start, end)
+
+        if not metrics_files:
+            messagebox.showwarning("No metrics files", f"No metrics files found for {start.date()} to {end.date()}.")
+            return
+        if not events_files:
+            messagebox.showwarning("No events files", f"No events files found for {start.date()} to {end.date()}.")
+
+        # Load metrics
+        metrics_dfs = []
+        for p in metrics_files:
             try:
-                tmin_ts = pd.to_datetime(tmin, errors="raise")
-            except Exception:
-                messagebox.showwarning("Time parse", f"Could not parse time min: {tmin}")
+                metrics_dfs.append(_load_metrics_csv(p))
+            except Exception as e:
+                messagebox.showerror("Metrics load failed", f"{p.name}\n\n{e}")
+                return
 
-        if tmax:
+        metrics = pd.concat(metrics_dfs, ignore_index=True).sort_values("Time").reset_index(drop=True)
+
+        # Load events
+        all_events: List[EventRow] = []
+        for p in events_files:
             try:
-                tmax_ts = pd.to_datetime(tmax, errors="raise")
-            except Exception:
-                messagebox.showwarning("Time parse", f"Could not parse time max: {tmax}")
+                all_events.extend(_load_events_txt(p))
+            except Exception as e:
+                messagebox.showerror("Events load failed", f"{p.name}\n\n{e}")
+                return
 
-        return tmin_ts, tmax_ts
+        tol = int(self.tolerance_var.get())
+        faults = _build_fault_points(metrics, all_events, tolerance_sec=tol)
 
-    def _keyword_list(self) -> List[str]:
-        raw = self.filter_keywords.get().strip()
-        if not raw:
-            return []
-        return [k.strip().lower() for k in raw.split(",") if k.strip()]
+        # Plot
+        self._style_axes()
 
-    def _filter_fault_df(self, df: pd.DataFrame, label_col: str = "label") -> pd.DataFrame:
-        if df is None or df.empty:
-            return df
+        if self.show_heatmap_var.get():
+            self._plot_heatmap(faults)
 
-        out = df.copy()
+        if self.show_track_var.get():
+            self._plot_track(metrics)
 
-        # Time filter (if time exists)
-        tmin_ts, tmax_ts = self._parse_tmin_tmax()
-        if "time" in out.columns:
-            if tmin_ts is not None:
-                out = out[out["time"] >= tmin_ts]
-            if tmax_ts is not None:
-                out = out[out["time"] <= tmax_ts]
+        if self.show_fault_points_var.get():
+            self._plot_fault_points(faults)
 
-        # Keyword filter
-        keys = self._keyword_list()
-        if keys and label_col in out.columns:
-            lab = out[label_col].astype(str).str.lower()
-            mask = np.zeros(len(out), dtype=bool)
-            for k in keys:
-                mask |= lab.str.contains(re.escape(k), na=False)
-            out = out[mask]
+        self.canvas.draw()
 
-        return out
+        self.status_var.set(
+            f"Loaded metrics files: {len(metrics_files)} | events files: {len(events_files)} | "
+            f"matched faults: {len(faults)} (tol={tol}s)"
+        )
 
-    # ---------- Plotting ----------
-    def update_plot(self):
-        try:
-            self._style_polar_axes()
-
-            # Prepare track from metrics
-            track = self._extract_track_from_metrics()
-
-            # Prepare faults
-            faults = self._collect_fault_points(track)
-
-            # Plot components
-            if self.show_heatmap.get():
-                self._plot_heatmap(faults)
-
-            if self.show_track.get():
-                self._plot_track(track)
-
-            if self.show_fault_points.get():
-                self._plot_fault_points(faults)
-
-            self.canvas.draw()
-
-            n_track = 0 if track is None else len(track)
-            n_fault = 0 if faults is None else len(faults)
-            self.status.config(text=f"Plotted. Track points: {n_track:,} | Fault points: {n_fault:,}")
-        except Exception as e:
-            messagebox.showerror("Plot error", f"Failed to plot:\n{e}")
-
-    def _extract_track_from_metrics(self) -> Optional[pd.DataFrame]:
-        df = self.state.df_metrics
-        if df is None or df.empty:
-            return None
-
-        tcol = self.metrics_time_col.get().strip()
-        azcol = self.metrics_az_col.get().strip()
-        elcol = self.metrics_el_col.get().strip()
-
-        if not tcol or not azcol or not elcol:
-            # Allow plotting faults only (events)
-            return None
-
-        out = df[[tcol, azcol, elcol]].copy()
-        out.columns = ["time_raw", "az", "el"]
-
-        # Parse time
-        tseries = _try_parse_datetime_series(out["time_raw"])
-        if tseries is None:
-            out["time"] = pd.NaT
-        else:
-            out["time"] = tseries
-
-        # Clean numeric
-        out["az"] = pd.to_numeric(out["az"], errors="coerce")
-        out["el"] = pd.to_numeric(out["el"], errors="coerce")
-
-        out = out.dropna(subset=["az", "el"])
-        out["az"] = out["az"].map(_normalize_az)
-        out["el"] = out["el"].clip(lower=0, upper=90)
-
-        # Time filter
-        tmin_ts, tmax_ts = self._parse_tmin_tmax()
-        if "time" in out.columns and out["time"].notna().any():
-            if tmin_ts is not None:
-                out = out[out["time"] >= tmin_ts]
-            if tmax_ts is not None:
-                out = out[out["time"] <= tmax_ts]
-
-        return out.reset_index(drop=True)
-
-    def _collect_fault_points(self, track: Optional[pd.DataFrame]) -> pd.DataFrame:
-        """
-        Returns DataFrame with columns: az, el, label, source
-        """
-        pieces = []
-
-        # Faults from events TXT
-        if self.events_use.get():
-            ev = self.state.df_events
-            if ev is not None and not ev.empty:
-                ev2 = ev.copy()
-                # Keep only rows with az/el present
-                ev2["az"] = pd.to_numeric(ev2["az"], errors="coerce")
-                ev2["el"] = pd.to_numeric(ev2["el"], errors="coerce")
-                ev2 = ev2.dropna(subset=["az", "el"])
-                ev2["az"] = ev2["az"].map(_normalize_az)
-                ev2["el"] = ev2["el"].clip(lower=0, upper=90)
-                ev2 = self._filter_fault_df(ev2, label_col="label")
-                ev2["source"] = "events_txt"
-                pieces.append(ev2[["az", "el", "label", "source"]])
-
-        # Faults from metrics fault/status column (if enabled)
-        if self.metrics_fault_use.get():
-            dfm = self.state.df_metrics
-            fcol = self.metrics_fault_col.get().strip()
-            azcol = self.metrics_az_col.get().strip()
-            elcol = self.metrics_el_col.get().strip()
-
-            if dfm is not None and not dfm.empty and fcol and azcol and elcol:
-                tmp = dfm[[azcol, elcol, fcol]].copy()
-                tmp.columns = ["az", "el", "label"]
-
-                tmp["az"] = pd.to_numeric(tmp["az"], errors="coerce")
-                tmp["el"] = pd.to_numeric(tmp["el"], errors="coerce")
-
-                # Fault definition: label not blank/zero/OK
-                lab = tmp["label"].astype(str).str.strip()
-                is_fault = (
-                    lab.ne("") &
-                    ~lab.str.fullmatch(r"0+(\.0+)?", na=False) &
-                    ~lab.str.lower().isin(["ok", "normal", "none", "nan"])
-                )
-
-                tmp = tmp[is_fault].dropna(subset=["az", "el"])
-                tmp["az"] = tmp["az"].map(_normalize_az)
-                tmp["el"] = tmp["el"].clip(lower=0, upper=90)
-
-                tmp = self._filter_fault_df(tmp, label_col="label")
-                tmp["source"] = "metrics_csv"
-                pieces.append(tmp[["az", "el", "label", "source"]])
-
-        if not pieces:
-            return pd.DataFrame(columns=["az", "el", "label", "source"])
-
-        out = pd.concat(pieces, ignore_index=True)
-        return out
-
-    def _plot_track(self, track: Optional[pd.DataFrame]):
-        if track is None or track.empty:
+    def _plot_track(self, metrics: pd.DataFrame):
+        if metrics.empty:
             return
-        theta = np.deg2rad(track["az"].to_numpy())
-        r = np.array([_to_polar_r(e) for e in track["el"].to_numpy()], dtype=float)
-
-        # Track line (motion)
+        theta = np.deg2rad(metrics["Antenna azimuth (deg)"].to_numpy())
+        r = np.array([_to_polar_r(e) for e in metrics["Antenna elevation (deg)"].to_numpy()], dtype=float)
         self.ax.plot(theta, r, linewidth=2.0)
-
-        # Marker at start (small)
         self.ax.scatter(theta[:1], r[:1], s=35, marker="^")
 
     def _plot_fault_points(self, faults: pd.DataFrame):
-        if faults is None or faults.empty:
+        if faults.empty:
             return
-        theta = np.deg2rad(faults["az"].to_numpy())
-        r = np.array([_to_polar_r(e) for e in faults["el"].to_numpy()], dtype=float)
-
-        # Points
+        theta = np.deg2rad(faults["az_deg"].to_numpy(dtype=float))
+        r = np.array([_to_polar_r(e) for e in faults["el_deg"].to_numpy(dtype=float)], dtype=float)
         self.ax.scatter(theta, r, s=28, alpha=0.9)
 
     def _plot_heatmap(self, faults: pd.DataFrame):
-        if faults is None or faults.empty:
+        if faults.empty:
             return
 
-        az_bin = float(self.az_bin_deg.get())
-        el_bin = float(self.el_bin_deg.get())
-
-        az_bin = _clamp(az_bin, 1.0, 60.0)
-        el_bin = _clamp(el_bin, 1.0, 45.0)
+        az_bin = float(self.az_bin_var.get())
+        el_bin = float(self.el_bin_var.get())
+        az_bin = max(1.0, min(60.0, az_bin))
+        el_bin = max(1.0, min(45.0, el_bin))
 
         az_edges = np.arange(0, 360 + az_bin, az_bin)
         el_edges = np.arange(0, 90 + el_bin, el_bin)
 
-        az = faults["az"].to_numpy(dtype=float)
-        el = faults["el"].to_numpy(dtype=float)
+        az = faults["az_deg"].to_numpy(dtype=float)
+        el = faults["el_deg"].to_numpy(dtype=float)
 
-        # 2D histogram in az/el space
         H, az_e, el_e = np.histogram2d(az, el, bins=[az_edges, el_edges])
 
-        # Convert to polar mesh:
-        # - theta edges: az edges
-        # - r edges: 90 - el edges (note reverse)
         theta_edges = np.deg2rad(az_e)
-        r_edges = 90.0 - el_e  # el=0 -> r=90, el=90 -> r=0 (descending)
-
-        # histogram2d returns H shape (len(az_edges)-1, len(el_edges)-1)
-        # but our r_edges is descending; we want ascending r for pcolormesh
-        # So flip elevation axis:
+        r_edges = 90.0 - el_e  # descending
         H_flip = np.flip(H, axis=1)
         r_edges_asc = np.sort(r_edges)
 
-        # Make meshgrid
         T, R = np.meshgrid(theta_edges, r_edges_asc, indexing="ij")
-
-        # pcolormesh expects C shape (M-1, N-1) if X,Y are (M,N)
-        # Here T,R are (len(theta_edges), len(r_edges_asc))
-        # so C should be (len(theta_edges)-1, len(r_edges_asc)-1)
-        # H_flip currently (len(az_edges)-1, len(el_edges)-1) matches that.
         self.ax.pcolormesh(T, R, H_flip, shading="auto", alpha=0.45)
 
-    # ---------- Export ----------
+    # -------------
+    # Export
+    # -------------
     def export_png(self):
         out = filedialog.asksaveasfilename(
             title="Save plot as PNG",
@@ -674,19 +572,15 @@ class App(tk.Tk):
         if not out:
             return
         try:
-            self.fig.savefig(out, dpi=200, bbox_inches="tight")
-            self.status.config(text=f"Saved: {out}")
+            self.fig.savefig(out, dpi=220, bbox_inches="tight")
+            self.status_var.set(f"Saved: {out}")
         except Exception as e:
-            messagebox.showerror("Export failed", f"Could not save PNG:\n{e}")
+            messagebox.showerror("Export failed", str(e))
 
 
 def main():
-    try:
-        app = App()
-        app.mainloop()
-    except KeyboardInterrupt:
-        pass
-
+    app = App()
+    app.mainloop()
 
 if __name__ == "__main__":
     main()
