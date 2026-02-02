@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-Antenna Fault Heatmap GUI (Az/El Skyplot)
-- User selects a root folder that contains:
-    root/
-      Events/   -> Events_YYYY-MM-DD_*.log.txt
-      Metrics/  -> Metrics_YYYY-MM-DD_*.log.csv
-- User selects Year, Month (All or specific), Day (All or specific)
-- Script auto-loads matching files, matches events -> nearest metrics az/el, and plots:
-    - heatmap (fault density in az/el bins)
-    - fault points
-    - motion track (optional)
+Antenna Fault Heatmap GUI (Az/El Skyplot) — ERROR CODE ONLY
+
+Folder structure:
+  Root/
+    Events/   -> Events_YYYY-MM-DD_*.log.txt
+    Metrics/  -> Metrics_YYYY-MM-DD_*.log.csv
+
+Behavior:
+- Only reads "fault lines" from Events TXT that contain: "Error code ####"
+- Extracts timestamp from the line and matches to nearest metrics timestamp
+- Uses the matched row's:
+    "Antenna azimuth (deg)"
+    "Antenna elevation (deg)"
+- Plots a red frequency heatmap (more frequent faults => deeper red)
 
 Install:
   pip install pandas numpy matplotlib
@@ -38,43 +42,33 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 
 # =========================
-# CONFIG (defaults)
+# Defaults
 # =========================
-
-MATCH_TOLERANCE_SEC = 5   # events must be within this many seconds of a metrics row
-AZ_BINS_DEG = 5           # heatmap az bin width
-EL_BINS_DEG = 5           # heatmap el bin width
-
-# Fault detection: treat events whose message begins with one of these as a "fault"
-FAULT_PREFIXES = (
-    "Fault:",
-    "FAULT:",
-    "Alarm:",
-    "ALARM:",
-    "Error:",
-    "ERROR:",
-    "Motion: Axis error",
-)
+MATCH_TOLERANCE_SEC = 5    # maximum allowed time difference between event and nearest metrics row
+AZ_BIN_DEG = 5             # heatmap az bin width (degrees)
+EL_BIN_DEG = 5             # heatmap el bin width (degrees)
 
 # Filename patterns
-# Metrics_2025-12-19_00-00-00.log.csv
-# Events_2025-12-19_00-29-31.log.txt
 METRICS_RE = re.compile(r"^Metrics_(\d{4}-\d{2}-\d{2})_\d{2}-\d{2}-\d{2}\.log\.csv$", re.IGNORECASE)
 EVENTS_RE  = re.compile(r"^Events_(\d{4}-\d{2}-\d{2})_\d{2}-\d{2}-\d{2}\.log\.txt$", re.IGNORECASE)
 
-# Events line pattern:
-# 2025-12-19 06:05:59.638,Fault: ...
+# Event line pattern: timestamp at start
+# Example:
+# 2025-12-19 06:05:59.638,Fault: ... (Error code 7901)
 EVENT_LINE_RE = re.compile(
     r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d{1,6})?),\s*(?P<msg>.*)$"
 )
+
+# Extract only error codes like 7901
+ERROR_CODE_RE = re.compile(r"\bError\s*code\s*(?P<code>\d{3,6})\b", re.IGNORECASE)
 
 
 # =========================
 # Helpers
 # =========================
 
-def _parse_dt(s: str) -> datetime:
-    # supports optional fractional seconds
+def parse_dt(s: str) -> datetime:
+    """Parse 'YYYY-MM-DD HH:MM:SS(.ffffff)'."""
     if "." in s:
         main, frac = s.split(".", 1)
         frac = (frac + "000000")[:6]
@@ -82,15 +76,15 @@ def _parse_dt(s: str) -> datetime:
         return base.replace(microsecond=int(frac))
     return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
 
-def _to_polar_r(el_deg: float) -> float:
-    # center=zenith (90), outer=horizon (0)
+def to_polar_r(el_deg: float) -> float:
+    """Skyplot radius: r=0 at el=90 (zenith), r=90 at el=0 (horizon)."""
     return 90.0 - el_deg
 
-def _date_range_from_selection(year: int, month: str, day: str) -> Tuple[datetime, datetime]:
+def date_range_from_selection(year: int, month: str, day: str) -> Tuple[datetime, datetime]:
     """
     month: "All" or "01".."12"
     day: "All" or "01".."31"
-    returns [start, end)
+    Returns [start, end)
     """
     if month == "All":
         return datetime(year, 1, 1), datetime(year + 1, 1, 1)
@@ -105,10 +99,7 @@ def _date_range_from_selection(year: int, month: str, day: str) -> Tuple[datetim
     start = datetime(year, m, d)
     return start, start + timedelta(days=1)
 
-def _is_fault_message(msg: str) -> bool:
-    return any(msg.startswith(pfx) for pfx in FAULT_PREFIXES)
-
-def _find_files_in_range(metrics_dir: Path, events_dir: Path, start: datetime, end: datetime) -> Tuple[List[Path], List[Path]]:
+def find_files_in_range(metrics_dir: Path, events_dir: Path, start: datetime, end: datetime) -> Tuple[List[Path], List[Path]]:
     metrics_files: List[Path] = []
     events_files: List[Path] = []
 
@@ -134,7 +125,7 @@ def _find_files_in_range(metrics_dir: Path, events_dir: Path, start: datetime, e
     events_files.sort()
     return metrics_files, events_files
 
-def _list_available_years(metrics_dir: Path, events_dir: Path) -> List[int]:
+def list_available_years(metrics_dir: Path, events_dir: Path) -> List[int]:
     years = set()
 
     if metrics_dir.exists():
@@ -151,7 +142,7 @@ def _list_available_years(metrics_dir: Path, events_dir: Path) -> List[int]:
 
     return sorted(years)
 
-def _list_available_dates_for_year(metrics_dir: Path, events_dir: Path, year: int) -> List[str]:
+def list_available_dates_for_year(metrics_dir: Path, events_dir: Path, year: int) -> List[str]:
     dates = set()
 
     if metrics_dir.exists():
@@ -168,10 +159,10 @@ def _list_available_dates_for_year(metrics_dir: Path, events_dir: Path, year: in
 
     return sorted(dates)
 
-def _load_metrics_csv(path: Path) -> pd.DataFrame:
+def load_metrics_csv(path: Path) -> pd.DataFrame:
     """
-    Metrics CSV may have junk lines before the real CSV header.
-    We find the first row that starts with "Time" and read from there.
+    Metrics CSV may contain pre-header lines.
+    We find the first row that starts with Time and read from there.
     Required columns:
       Time
       Antenna azimuth (deg)
@@ -210,37 +201,47 @@ def _load_metrics_csv(path: Path) -> pd.DataFrame:
     return df[["Time", "Antenna azimuth (deg)", "Antenna elevation (deg)"]].reset_index(drop=True)
 
 @dataclass
-class EventRow:
+class FaultEvent:
     time: datetime
+    code: str
     msg: str
 
-def _load_events_txt(path: Path) -> List[EventRow]:
-    out: List[EventRow] = []
+def load_fault_events_txt(path: Path) -> List[FaultEvent]:
+    """
+    ONLY returns events that contain 'Error code ####'.
+    Timestamp must be at start of the line.
+    """
+    out: List[FaultEvent] = []
     with path.open("r", encoding="utf-8", errors="ignore") as f:
         for raw in f:
             line = raw.strip()
             m = EVENT_LINE_RE.match(line)
             if not m:
                 continue
-            ts = _parse_dt(m.group("ts"))
+
             msg = m.group("msg").strip()
-            out.append(EventRow(ts, msg))
+
+            code_m = ERROR_CODE_RE.search(msg)
+            if not code_m:
+                continue  # not a coded error => ignore
+
+            ts = parse_dt(m.group("ts"))
+            code = code_m.group("code")
+            out.append(FaultEvent(ts, code, msg))
     return out
 
-def _build_fault_points(metrics: pd.DataFrame, events: List[EventRow], tolerance_sec: int) -> pd.DataFrame:
+def match_faults_to_metrics(metrics: pd.DataFrame, faults: List[FaultEvent], tolerance_sec: int) -> pd.DataFrame:
     """
-    Match each fault event to nearest metrics timestamp using merge_asof.
-    Returns DataFrame columns:
-      Time_event, msg, Time_metrics, az_deg, el_deg
+    Nearest-time match each fault to metrics to obtain az/el.
+
+    Output columns:
+      Time_event, code, msg, Time_metrics, az_deg, el_deg
     """
-    if metrics.empty:
-        return pd.DataFrame(columns=["Time_event", "msg", "Time_metrics", "az_deg", "el_deg"])
+    if metrics.empty or not faults:
+        return pd.DataFrame(columns=["Time_event", "code", "msg", "Time_metrics", "az_deg", "el_deg"])
 
-    fault_events = [(e.time, e.msg) for e in events if _is_fault_message(e.msg)]
-    if not fault_events:
-        return pd.DataFrame(columns=["Time_event", "msg", "Time_metrics", "az_deg", "el_deg"])
+    df_ev = pd.DataFrame([(f.time, f.code, f.msg) for f in faults], columns=["Time_event", "code", "msg"]).sort_values("Time_event")
 
-    df_ev = pd.DataFrame(fault_events, columns=["Time_event", "msg"]).sort_values("Time_event")
     df_met = metrics.rename(columns={
         "Time": "Time_metrics",
         "Antenna azimuth (deg)": "az_deg",
@@ -253,8 +254,9 @@ def _build_fault_points(metrics: pd.DataFrame, events: List[EventRow], tolerance
         left_on="Time_event",
         right_on="Time_metrics",
         direction="nearest",
-        tolerance=pd.Timedelta(seconds=tolerance_sec)
+        tolerance=pd.Timedelta(seconds=tolerance_sec),
     )
+
     merged = merged.dropna(subset=["Time_metrics", "az_deg", "el_deg"]).reset_index(drop=True)
     return merged
 
@@ -266,7 +268,7 @@ def _build_fault_points(metrics: pd.DataFrame, events: List[EventRow], tolerance
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Antenna Fault Heat Map (Az/El) — Auto Match Events ↔ Metrics")
+        self.title("Antenna Fault Frequency Heat Map (Az/El) — Error Code Only")
         self.geometry("1200x780")
 
         self.root_dir: Optional[Path] = None
@@ -277,15 +279,14 @@ class App(tk.Tk):
         self.month_var = tk.StringVar(value="All")
         self.day_var = tk.StringVar(value="All")
 
-        self.show_track_var = tk.BooleanVar(value=True)
-        self.show_fault_points_var = tk.BooleanVar(value=True)
+        self.show_fault_points_var = tk.BooleanVar(value=False)  # you asked “only map” => default off
         self.show_heatmap_var = tk.BooleanVar(value=True)
 
         self.tolerance_var = tk.IntVar(value=MATCH_TOLERANCE_SEC)
-        self.az_bin_var = tk.DoubleVar(value=AZ_BINS_DEG)
-        self.el_bin_var = tk.DoubleVar(value=EL_BINS_DEG)
+        self.az_bin_var = tk.DoubleVar(value=AZ_BIN_DEG)
+        self.el_bin_var = tk.DoubleVar(value=EL_BIN_DEG)
 
-        self.status_var = tk.StringVar(value="Select root folder that contains Events/ and Metrics/.")
+        self.status_var = tk.StringVar(value="Choose root folder containing Events/ and Metrics/.")
 
         self._build_ui()
         self._build_plot()
@@ -301,7 +302,7 @@ class App(tk.Tk):
         right.pack(side="right", fill="both", expand=True)
 
         # Folder selector
-        lf_folder = ttk.LabelFrame(left, text="1) Select Root Folder", padding=10)
+        lf_folder = ttk.LabelFrame(left, text="1) Root Folder", padding=10)
         lf_folder.pack(fill="x", pady=(0, 10))
 
         ttk.Button(lf_folder, text="Choose Root Folder", command=self.choose_root_folder).pack(fill="x")
@@ -318,8 +319,10 @@ class App(tk.Tk):
         self.year_cb.bind("<<ComboboxSelected>>", lambda e: self.refresh_month_day_options())
 
         ttk.Label(lf_date, text="Month:").pack(anchor="w")
-        self.month_cb = ttk.Combobox(lf_date, textvariable=self.month_var, state="readonly",
-                                     values=["All"] + [f"{i:02d}" for i in range(1, 13)])
+        self.month_cb = ttk.Combobox(
+            lf_date, textvariable=self.month_var, state="readonly",
+            values=["All"] + [f"{i:02d}" for i in range(1, 13)]
+        )
         self.month_cb.pack(fill="x", pady=(0, 6))
         self.month_cb.bind("<<ComboboxSelected>>", lambda e: self.refresh_month_day_options())
 
@@ -327,13 +330,12 @@ class App(tk.Tk):
         self.day_cb = ttk.Combobox(lf_date, textvariable=self.day_var, state="readonly", values=["All"])
         self.day_cb.pack(fill="x", pady=(0, 2))
 
-        # Plot options
-        lf_opts = ttk.LabelFrame(left, text="3) Plot Options", padding=10)
+        # Options
+        lf_opts = ttk.LabelFrame(left, text="3) Options", padding=10)
         lf_opts.pack(fill="x", pady=(0, 10))
 
-        ttk.Checkbutton(lf_opts, text="Show motion track (from Metrics)", variable=self.show_track_var).pack(anchor="w")
-        ttk.Checkbutton(lf_opts, text="Show fault points", variable=self.show_fault_points_var).pack(anchor="w")
-        ttk.Checkbutton(lf_opts, text="Show heat map", variable=self.show_heatmap_var).pack(anchor="w")
+        ttk.Checkbutton(lf_opts, text="Show fault points (on top of heatmap)", variable=self.show_fault_points_var).pack(anchor="w")
+        ttk.Checkbutton(lf_opts, text="Show heat map (frequency)", variable=self.show_heatmap_var).pack(anchor="w")
 
         row = ttk.Frame(lf_opts)
         row.pack(fill="x", pady=(8, 0))
@@ -354,10 +356,8 @@ class App(tk.Tk):
         ttk.Button(lf_actions, text="Load + Plot", command=self.load_and_plot).pack(fill="x")
         ttk.Button(lf_actions, text="Export PNG", command=self.export_png).pack(fill="x", pady=(6, 0))
 
-        # Status
         ttk.Label(left, textvariable=self.status_var, wraplength=340).pack(fill="x", pady=(6, 0))
 
-        # Plot container
         self.plot_frame = ttk.Frame(right)
         self.plot_frame.pack(fill="both", expand=True)
 
@@ -375,20 +375,18 @@ class App(tk.Tk):
         ax = self.ax
         ax.clear()
         ax.set_theta_zero_location("N")
-        ax.set_theta_direction(-1)     # clockwise; E right
+        ax.set_theta_direction(-1)     # clockwise
         ax.set_rlim(0, 90)
 
         rings = [0, 15, 30, 45, 60, 75, 90]
         ax.set_yticks(rings)
         ax.set_yticklabels([f"{int(90-r)}°" for r in rings])  # elevation labels
         ax.grid(True, alpha=0.35)
-        ax.set_title("Antenna Fault Heat Map (Az/El Sky Plot)", pad=18)
+        ax.set_title("Fault Frequency Heat Map (Az/El)", pad=18)
 
-    # -------------
-    # Folder + date
-    # -------------
+    # -------- Folder + date --------
     def choose_root_folder(self):
-        folder = filedialog.askdirectory(title="Select ROOT folder that contains Events/ and Metrics/")
+        folder = filedialog.askdirectory(title="Select ROOT folder with Events/ and Metrics/")
         if not folder:
             return
 
@@ -399,7 +397,7 @@ class App(tk.Tk):
         if not events.exists() or not metrics.exists():
             messagebox.showerror(
                 "Folder structure not found",
-                "Your selected root folder must contain:\n"
+                "Selected root folder must contain:\n"
                 "  Events\\  (txt logs)\n"
                 "  Metrics\\ (csv logs)\n\n"
                 f"Selected: {root}"
@@ -411,18 +409,20 @@ class App(tk.Tk):
         self.metrics_dir = metrics
         self.folder_label.config(text=str(root))
 
-        years = _list_available_years(metrics, events)
+        years = list_available_years(metrics, events)
         if not years:
             self.year_cb["values"] = []
             self.year_var.set("")
-            self.status_var.set("No matching Metrics_/Events_ files found in those folders.")
+            self.status_var.set("No matching Metrics_/Events_ files found.")
             return
 
         self.year_cb["values"] = [str(y) for y in years]
-        self.year_var.set(str(years[-1]))  # default most recent year
+        self.year_var.set(str(years[-1]))
+        self.month_var.set("All")
+        self.day_var.set("All")
         self.refresh_month_day_options()
 
-        self.status_var.set("Folder ok. Choose Year/Month/Day then click Load + Plot.")
+        self.status_var.set("Folder OK. Select Year/Month/Day then Load + Plot.")
 
     def refresh_month_day_options(self):
         if not (self.metrics_dir and self.events_dir):
@@ -431,112 +431,89 @@ class App(tk.Tk):
             return
 
         year = int(self.year_var.get())
-        dates = _list_available_dates_for_year(self.metrics_dir, self.events_dir, year)
+        dates = list_available_dates_for_year(self.metrics_dir, self.events_dir, year)
 
-        # Day dropdown depends on month selection
         month = self.month_var.get()
-
-        valid_days = set()
         if month == "All":
-            # day can be All only (or we could allow 01..31 but it’s ambiguous without month)
             self.day_cb["values"] = ["All"]
             self.day_var.set("All")
             return
 
-        # If month fixed, list available days in that month
-        for d in dates:
-            if d[5:7] == month:
-                valid_days.add(d[8:10])
-
-        day_values = ["All"] + sorted(valid_days)
+        valid_days = sorted({d[8:10] for d in dates if d[5:7] == month})
+        day_values = ["All"] + valid_days
         self.day_cb["values"] = day_values
         if self.day_var.get() not in day_values:
             self.day_var.set("All")
 
-    # -------------
-    # Load + plot
-    # -------------
+    # -------- Load + plot --------
     def load_and_plot(self):
         if not (self.metrics_dir and self.events_dir):
-            messagebox.showwarning("Missing folder", "Please choose the root folder first.")
+            messagebox.showwarning("Missing folder", "Choose the root folder first.")
             return
         if not self.year_var.get().isdigit():
-            messagebox.showwarning("Missing year", "Please select a year.")
+            messagebox.showwarning("Missing year", "Select a year.")
             return
 
         year = int(self.year_var.get())
         month = self.month_var.get()
         day = self.day_var.get()
 
-        start, end = _date_range_from_selection(year, month, day)
-
-        metrics_files, events_files = _find_files_in_range(self.metrics_dir, self.events_dir, start, end)
+        start, end = date_range_from_selection(year, month, day)
+        metrics_files, events_files = find_files_in_range(self.metrics_dir, self.events_dir, start, end)
 
         if not metrics_files:
-            messagebox.showwarning("No metrics files", f"No metrics files found for {start.date()} to {end.date()}.")
+            messagebox.showwarning("No metrics", f"No metrics files found for range {start.date()} to {end.date()}.")
             return
         if not events_files:
-            messagebox.showwarning("No events files", f"No events files found for {start.date()} to {end.date()}.")
+            messagebox.showwarning("No events", f"No events files found for range {start.date()} to {end.date()}.")
 
         # Load metrics
         metrics_dfs = []
         for p in metrics_files:
             try:
-                metrics_dfs.append(_load_metrics_csv(p))
+                metrics_dfs.append(load_metrics_csv(p))
             except Exception as e:
                 messagebox.showerror("Metrics load failed", f"{p.name}\n\n{e}")
                 return
-
         metrics = pd.concat(metrics_dfs, ignore_index=True).sort_values("Time").reset_index(drop=True)
 
-        # Load events
-        all_events: List[EventRow] = []
+        # Load ONLY coded faults from events
+        faults_all: List[FaultEvent] = []
         for p in events_files:
             try:
-                all_events.extend(_load_events_txt(p))
+                faults_all.extend(load_fault_events_txt(p))
             except Exception as e:
                 messagebox.showerror("Events load failed", f"{p.name}\n\n{e}")
                 return
 
         tol = int(self.tolerance_var.get())
-        faults = _build_fault_points(metrics, all_events, tolerance_sec=tol)
+        matched = match_faults_to_metrics(metrics, faults_all, tolerance_sec=tol)
 
         # Plot
         self._style_axes()
 
         if self.show_heatmap_var.get():
-            self._plot_heatmap(faults)
-
-        if self.show_track_var.get():
-            self._plot_track(metrics)
+            self._plot_heatmap_red(matched)
 
         if self.show_fault_points_var.get():
-            self._plot_fault_points(faults)
+            self._plot_fault_points(matched)
 
         self.canvas.draw()
 
         self.status_var.set(
-            f"Loaded metrics files: {len(metrics_files)} | events files: {len(events_files)} | "
-            f"matched faults: {len(faults)} (tol={tol}s)"
+            f"Metrics files: {len(metrics_files)} | Events files: {len(events_files)} | "
+            f"Coded faults: {len(faults_all)} | Matched: {len(matched)} (tol={tol}s)"
         )
 
-    def _plot_track(self, metrics: pd.DataFrame):
-        if metrics.empty:
+    def _plot_fault_points(self, matched: pd.DataFrame):
+        if matched.empty:
             return
-        theta = np.deg2rad(metrics["Antenna azimuth (deg)"].to_numpy())
-        r = np.array([_to_polar_r(e) for e in metrics["Antenna elevation (deg)"].to_numpy()], dtype=float)
-        self.ax.plot(theta, r, linewidth=2.0)
-        self.ax.scatter(theta[:1], r[:1], s=35, marker="^")
+        theta = np.deg2rad(matched["az_deg"].to_numpy(dtype=float))
+        r = np.array([to_polar_r(e) for e in matched["el_deg"].to_numpy(dtype=float)], dtype=float)
+        self.ax.scatter(theta, r, s=22, alpha=0.9)
 
-    def _plot_fault_points(self, faults: pd.DataFrame):
-        if faults.empty:
-            return
-        theta = np.deg2rad(faults["az_deg"].to_numpy(dtype=float))
-        r = np.array([_to_polar_r(e) for e in faults["el_deg"].to_numpy(dtype=float)], dtype=float)
-        self.ax.scatter(theta, r, s=28, alpha=0.9)
-
-    def _plot_heatmap(self, faults: pd.DataFrame):
-        if faults.empty:
+    def _plot_heatmap_red(self, matched: pd.DataFrame):
+        if matched.empty:
             return
 
         az_bin = float(self.az_bin_var.get())
@@ -547,22 +524,28 @@ class App(tk.Tk):
         az_edges = np.arange(0, 360 + az_bin, az_bin)
         el_edges = np.arange(0, 90 + el_bin, el_bin)
 
-        az = faults["az_deg"].to_numpy(dtype=float)
-        el = faults["el_deg"].to_numpy(dtype=float)
+        az = matched["az_deg"].to_numpy(dtype=float)
+        el = matched["el_deg"].to_numpy(dtype=float)
 
         H, az_e, el_e = np.histogram2d(az, el, bins=[az_edges, el_edges])
 
+        # Convert to polar mesh: theta=az, r=90-el
         theta_edges = np.deg2rad(az_e)
-        r_edges = 90.0 - el_e  # descending
-        H_flip = np.flip(H, axis=1)
-        r_edges_asc = np.sort(r_edges)
+        r_edges_desc = 90.0 - el_e  # descending
+        H_flip = np.flip(H, axis=1)  # flip elevation to match ascending r
+        r_edges_asc = np.sort(r_edges_desc)
 
         T, R = np.meshgrid(theta_edges, r_edges_asc, indexing="ij")
-        self.ax.pcolormesh(T, R, H_flip, shading="auto", alpha=0.45)
 
-    # -------------
-    # Export
-    # -------------
+        # Red frequency map
+        self.ax.pcolormesh(
+            T, R, H_flip,
+            shading="auto",
+            cmap="Reds",
+            alpha=0.85
+        )
+
+    # -------- Export --------
     def export_png(self):
         out = filedialog.asksaveasfilename(
             title="Save plot as PNG",
@@ -579,8 +562,7 @@ class App(tk.Tk):
 
 
 def main():
-    app = App()
-    app.mainloop()
+    App().mainloop()
 
 if __name__ == "__main__":
     main()
