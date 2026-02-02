@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Antenna Fault Heatmap GUI (Az/El Skyplot) — ERROR CODE ONLY
+Antenna Fault Heatmap GUI (Az/El Skyplot) — ERROR CODE ONLY + CLICK INSPECT
 
 Folder structure:
   Root/
@@ -8,12 +8,11 @@ Folder structure:
     Metrics/  -> Metrics_YYYY-MM-DD_*.log.csv
 
 Behavior:
-- Only reads "fault lines" from Events TXT that contain: "Error code ####"
-- Extracts timestamp from the line and matches to nearest metrics timestamp
-- Uses the matched row's:
-    "Antenna azimuth (deg)"
-    "Antenna elevation (deg)"
-- Plots a red frequency heatmap (more frequent faults => deeper red)
+- Only reads lines containing "Error code ####" from Events
+- Matches fault timestamp to nearest Metrics timestamp (within tolerance)
+- Uses matched az/el to build a frequency heatmap
+- Heatmap: bins with 0 faults are WHITE
+- Click on a heatmap cell -> shows which fault codes are inside that bin
 
 Install:
   pip install pandas numpy matplotlib
@@ -27,7 +26,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 
 import numpy as np
 import pandas as pd
@@ -44,7 +43,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 # =========================
 # Defaults
 # =========================
-MATCH_TOLERANCE_SEC = 5    # maximum allowed time difference between event and nearest metrics row
+MATCH_TOLERANCE_SEC = 5    # max allowed time difference between event and nearest metrics row
 AZ_BIN_DEG = 5             # heatmap az bin width (degrees)
 EL_BIN_DEG = 5             # heatmap el bin width (degrees)
 
@@ -52,14 +51,12 @@ EL_BIN_DEG = 5             # heatmap el bin width (degrees)
 METRICS_RE = re.compile(r"^Metrics_(\d{4}-\d{2}-\d{2})_\d{2}-\d{2}-\d{2}\.log\.csv$", re.IGNORECASE)
 EVENTS_RE  = re.compile(r"^Events_(\d{4}-\d{2}-\d{2})_\d{2}-\d{2}-\d{2}\.log\.txt$", re.IGNORECASE)
 
-# Event line pattern: timestamp at start
-# Example:
-# 2025-12-19 06:05:59.638,Fault: ... (Error code 7901)
+# Events line pattern: timestamp at start
 EVENT_LINE_RE = re.compile(
     r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d{1,6})?),\s*(?P<msg>.*)$"
 )
 
-# Extract only error codes like 7901
+# Extract error code
 ERROR_CODE_RE = re.compile(r"\bError\s*code\s*(?P<code>\d{3,6})\b", re.IGNORECASE)
 
 
@@ -68,7 +65,6 @@ ERROR_CODE_RE = re.compile(r"\bError\s*code\s*(?P<code>\d{3,6})\b", re.IGNORECAS
 # =========================
 
 def parse_dt(s: str) -> datetime:
-    """Parse 'YYYY-MM-DD HH:MM:SS(.ffffff)'."""
     if "." in s:
         main, frac = s.split(".", 1)
         frac = (frac + "000000")[:6]
@@ -77,15 +73,10 @@ def parse_dt(s: str) -> datetime:
     return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
 
 def to_polar_r(el_deg: float) -> float:
-    """Skyplot radius: r=0 at el=90 (zenith), r=90 at el=0 (horizon)."""
+    # center=zenith (90), outer=horizon (0)
     return 90.0 - el_deg
 
 def date_range_from_selection(year: int, month: str, day: str) -> Tuple[datetime, datetime]:
-    """
-    month: "All" or "01".."12"
-    day: "All" or "01".."31"
-    Returns [start, end)
-    """
     if month == "All":
         return datetime(year, 1, 1), datetime(year + 1, 1, 1)
 
@@ -127,42 +118,35 @@ def find_files_in_range(metrics_dir: Path, events_dir: Path, start: datetime, en
 
 def list_available_years(metrics_dir: Path, events_dir: Path) -> List[int]:
     years = set()
-
     if metrics_dir.exists():
         for p in metrics_dir.iterdir():
             m = METRICS_RE.match(p.name)
             if m:
                 years.add(int(m.group(1)[:4]))
-
     if events_dir.exists():
         for p in events_dir.iterdir():
             m = EVENTS_RE.match(p.name)
             if m:
                 years.add(int(m.group(1)[:4]))
-
     return sorted(years)
 
 def list_available_dates_for_year(metrics_dir: Path, events_dir: Path, year: int) -> List[str]:
     dates = set()
-
     if metrics_dir.exists():
         for p in metrics_dir.iterdir():
             m = METRICS_RE.match(p.name)
             if m and m.group(1).startswith(f"{year:04d}-"):
                 dates.add(m.group(1))
-
     if events_dir.exists():
         for p in events_dir.iterdir():
             m = EVENTS_RE.match(p.name)
             if m and m.group(1).startswith(f"{year:04d}-"):
                 dates.add(m.group(1))
-
     return sorted(dates)
 
 def load_metrics_csv(path: Path) -> pd.DataFrame:
     """
-    Metrics CSV may contain pre-header lines.
-    We find the first row that starts with Time and read from there.
+    Find header line that starts with Time then read CSV from there.
     Required columns:
       Time
       Antenna azimuth (deg)
@@ -192,11 +176,9 @@ def load_metrics_csv(path: Path) -> pd.DataFrame:
     df["Antenna azimuth (deg)"] = pd.to_numeric(df["Antenna azimuth (deg)"], errors="coerce")
     df["Antenna elevation (deg)"] = pd.to_numeric(df["Antenna elevation (deg)"], errors="coerce")
 
-    df = df.dropna(subset=["Time", "Antenna azimuth (deg)", "Antenna elevation (deg)"])
-    df = df.sort_values("Time")
-
+    df = df.dropna(subset=["Time", "Antenna azimuth (deg)", "Antenna elevation (deg)"]).sort_values("Time")
     df["Antenna azimuth (deg)"] = df["Antenna azimuth (deg)"] % 360.0
-    df["Antenna elevation (deg)"] = df["Antenna elevation (deg)"].clip(lower=0.0, upper=90.0)
+    df["Antenna elevation (deg)"] = df["Antenna elevation (deg)"].clip(0.0, 90.0)
 
     return df[["Time", "Antenna azimuth (deg)", "Antenna elevation (deg)"]].reset_index(drop=True)
 
@@ -208,8 +190,7 @@ class FaultEvent:
 
 def load_fault_events_txt(path: Path) -> List[FaultEvent]:
     """
-    ONLY returns events that contain 'Error code ####'.
-    Timestamp must be at start of the line.
+    Only returns lines that contain 'Error code ####' and have a timestamp at start.
     """
     out: List[FaultEvent] = []
     with path.open("r", encoding="utf-8", errors="ignore") as f:
@@ -220,10 +201,9 @@ def load_fault_events_txt(path: Path) -> List[FaultEvent]:
                 continue
 
             msg = m.group("msg").strip()
-
             code_m = ERROR_CODE_RE.search(msg)
             if not code_m:
-                continue  # not a coded error => ignore
+                continue
 
             ts = parse_dt(m.group("ts"))
             code = code_m.group("code")
@@ -232,7 +212,7 @@ def load_fault_events_txt(path: Path) -> List[FaultEvent]:
 
 def match_faults_to_metrics(metrics: pd.DataFrame, faults: List[FaultEvent], tolerance_sec: int) -> pd.DataFrame:
     """
-    Nearest-time match each fault to metrics to obtain az/el.
+    Match each fault timestamp to nearest metrics timestamp to obtain az/el.
 
     Output columns:
       Time_event, code, msg, Time_metrics, az_deg, el_deg
@@ -240,7 +220,10 @@ def match_faults_to_metrics(metrics: pd.DataFrame, faults: List[FaultEvent], tol
     if metrics.empty or not faults:
         return pd.DataFrame(columns=["Time_event", "code", "msg", "Time_metrics", "az_deg", "el_deg"])
 
-    df_ev = pd.DataFrame([(f.time, f.code, f.msg) for f in faults], columns=["Time_event", "code", "msg"]).sort_values("Time_event")
+    df_ev = pd.DataFrame(
+        [(f.time, f.code, f.msg) for f in faults],
+        columns=["Time_event", "code", "msg"]
+    ).sort_values("Time_event")
 
     df_met = metrics.rename(columns={
         "Time": "Time_metrics",
@@ -256,9 +239,7 @@ def match_faults_to_metrics(metrics: pd.DataFrame, faults: List[FaultEvent], tol
         direction="nearest",
         tolerance=pd.Timedelta(seconds=tolerance_sec),
     )
-
-    merged = merged.dropna(subset=["Time_metrics", "az_deg", "el_deg"]).reset_index(drop=True)
-    return merged
+    return merged.dropna(subset=["Time_metrics", "az_deg", "el_deg"]).reset_index(drop=True)
 
 
 # =========================
@@ -269,7 +250,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Antenna Fault Frequency Heat Map (Az/El) — Error Code Only")
-        self.geometry("1200x780")
+        self.geometry("1280x820")
 
         self.root_dir: Optional[Path] = None
         self.events_dir: Optional[Path] = None
@@ -279,14 +260,21 @@ class App(tk.Tk):
         self.month_var = tk.StringVar(value="All")
         self.day_var = tk.StringVar(value="All")
 
-        self.show_fault_points_var = tk.BooleanVar(value=False)  # you asked “only map” => default off
         self.show_heatmap_var = tk.BooleanVar(value=True)
+        self.show_fault_points_var = tk.BooleanVar(value=False)
 
         self.tolerance_var = tk.IntVar(value=MATCH_TOLERANCE_SEC)
         self.az_bin_var = tk.DoubleVar(value=AZ_BIN_DEG)
         self.el_bin_var = tk.DoubleVar(value=EL_BIN_DEG)
 
         self.status_var = tk.StringVar(value="Choose root folder containing Events/ and Metrics/.")
+        self.details_var = tk.StringVar(value="Click a heatmap cell to see details here.")
+
+        # For click inspection:
+        self._last_H = None
+        self._last_az_edges = None
+        self._last_el_edges = None
+        self._last_matched = None
 
         self._build_ui()
         self._build_plot()
@@ -334,8 +322,8 @@ class App(tk.Tk):
         lf_opts = ttk.LabelFrame(left, text="3) Options", padding=10)
         lf_opts.pack(fill="x", pady=(0, 10))
 
-        ttk.Checkbutton(lf_opts, text="Show fault points (on top of heatmap)", variable=self.show_fault_points_var).pack(anchor="w")
         ttk.Checkbutton(lf_opts, text="Show heat map (frequency)", variable=self.show_heatmap_var).pack(anchor="w")
+        ttk.Checkbutton(lf_opts, text="Show fault points (on top of heatmap)", variable=self.show_fault_points_var).pack(anchor="w")
 
         row = ttk.Frame(lf_opts)
         row.pack(fill="x", pady=(8, 0))
@@ -356,7 +344,12 @@ class App(tk.Tk):
         ttk.Button(lf_actions, text="Load + Plot", command=self.load_and_plot).pack(fill="x")
         ttk.Button(lf_actions, text="Export PNG", command=self.export_png).pack(fill="x", pady=(6, 0))
 
-        ttk.Label(left, textvariable=self.status_var, wraplength=340).pack(fill="x", pady=(6, 0))
+        # Details panel
+        lf_details = ttk.LabelFrame(left, text="Clicked Cell Details", padding=10)
+        lf_details.pack(fill="x", pady=(0, 10))
+        ttk.Label(lf_details, textvariable=self.details_var, wraplength=360, justify="left").pack(fill="x")
+
+        ttk.Label(left, textvariable=self.status_var, wraplength=360).pack(fill="x", pady=(6, 0))
 
         self.plot_frame = ttk.Frame(right)
         self.plot_frame.pack(fill="both", expand=True)
@@ -369,6 +362,10 @@ class App(tk.Tk):
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
 
         self._style_axes()
+
+        # Connect click handler
+        self.canvas.mpl_connect("button_press_event", self.on_plot_click)
+
         self.canvas.draw()
 
     def _style_axes(self):
@@ -423,6 +420,7 @@ class App(tk.Tk):
         self.refresh_month_day_options()
 
         self.status_var.set("Folder OK. Select Year/Month/Day then Load + Plot.")
+        self.details_var.set("Click a heatmap cell to see details here.")
 
     def refresh_month_day_options(self):
         if not (self.metrics_dir and self.events_dir):
@@ -477,7 +475,7 @@ class App(tk.Tk):
                 return
         metrics = pd.concat(metrics_dfs, ignore_index=True).sort_values("Time").reset_index(drop=True)
 
-        # Load ONLY coded faults from events
+        # Load coded faults
         faults_all: List[FaultEvent] = []
         for p in events_files:
             try:
@@ -492,8 +490,17 @@ class App(tk.Tk):
         # Plot
         self._style_axes()
 
+        # Reset click-inspection cache
+        self._last_H = None
+        self._last_az_edges = None
+        self._last_el_edges = None
+        self._last_matched = matched
+
         if self.show_heatmap_var.get():
-            self._plot_heatmap_red(matched)
+            H, az_edges, el_edges = self._plot_heatmap_white_zero(matched)
+            self._last_H = H
+            self._last_az_edges = az_edges
+            self._last_el_edges = el_edges
 
         if self.show_fault_points_var.get():
             self._plot_fault_points(matched)
@@ -504,6 +511,7 @@ class App(tk.Tk):
             f"Metrics files: {len(metrics_files)} | Events files: {len(events_files)} | "
             f"Coded faults: {len(faults_all)} | Matched: {len(matched)} (tol={tol}s)"
         )
+        self.details_var.set("Click a heatmap cell to see details here.")
 
     def _plot_fault_points(self, matched: pd.DataFrame):
         if matched.empty:
@@ -512,9 +520,13 @@ class App(tk.Tk):
         r = np.array([to_polar_r(e) for e in matched["el_deg"].to_numpy(dtype=float)], dtype=float)
         self.ax.scatter(theta, r, s=22, alpha=0.9)
 
-    def _plot_heatmap_red(self, matched: pd.DataFrame):
+    def _plot_heatmap_white_zero(self, matched: pd.DataFrame):
+        """
+        Returns (H, az_edges, el_edges) in the *az/el domain*.
+        Draws a polar pcolormesh using a masked array so H==0 shows white.
+        """
         if matched.empty:
-            return
+            return None, None, None
 
         az_bin = float(self.az_bin_var.get())
         el_bin = float(self.el_bin_var.get())
@@ -529,20 +541,95 @@ class App(tk.Tk):
 
         H, az_e, el_e = np.histogram2d(az, el, bins=[az_edges, el_edges])
 
-        # Convert to polar mesh: theta=az, r=90-el
+        # Mask zeros so they render as white
+        H_masked = np.ma.masked_where(H == 0, H)
+
+        # Convert to polar mesh: theta=az, r=90-el (needs elevation flip)
         theta_edges = np.deg2rad(az_e)
-        r_edges_desc = 90.0 - el_e  # descending
-        H_flip = np.flip(H, axis=1)  # flip elevation to match ascending r
+        r_edges_desc = 90.0 - el_e
+        H_flip = np.flip(H_masked, axis=1)
         r_edges_asc = np.sort(r_edges_desc)
 
         T, R = np.meshgrid(theta_edges, r_edges_asc, indexing="ij")
 
-        # Red frequency map
+        cmap = plt.cm.Reds.copy()
+        cmap.set_bad(color="white")  # masked cells -> white
+
         self.ax.pcolormesh(
             T, R, H_flip,
             shading="auto",
-            cmap="Reds",
-            alpha=0.85
+            cmap=cmap,
+            alpha=0.90
+        )
+
+        return H, az_edges, el_edges
+
+    # -------- Click handling --------
+    def on_plot_click(self, event):
+        # Only respond if we have heatmap cache and click is inside axes
+        if event.inaxes != self.ax:
+            return
+        if self._last_H is None or self._last_az_edges is None or self._last_el_edges is None:
+            return
+        if self._last_matched is None or self._last_matched.empty:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+
+        # event.xdata is theta (radians), event.ydata is r
+        theta = event.xdata
+        r = event.ydata
+
+        # Convert to az and el
+        az = (np.rad2deg(theta) % 360.0)
+        el = 90.0 - r
+
+        az_edges = self._last_az_edges
+        el_edges = self._last_el_edges
+
+        # Find bin indices
+        iaz = np.searchsorted(az_edges, az, side="right") - 1
+        iel = np.searchsorted(el_edges, el, side="right") - 1
+
+        if iaz < 0 or iel < 0 or iaz >= len(az_edges) - 1 or iel >= len(el_edges) - 1:
+            self.details_var.set("Clicked outside binned region.")
+            return
+
+        az_lo, az_hi = az_edges[iaz], az_edges[iaz + 1]
+        el_lo, el_hi = el_edges[iel], el_edges[iel + 1]
+
+        # Filter matched faults that fall in this bin
+        m = self._last_matched
+        in_bin = m[
+            (m["az_deg"] >= az_lo) & (m["az_deg"] < az_hi) &
+            (m["el_deg"] >= el_lo) & (m["el_deg"] < el_hi)
+        ].copy()
+
+        count = int(self._last_H[iaz, iel]) if self._last_H is not None else len(in_bin)
+
+        if in_bin.empty:
+            self.details_var.set(
+                f"Bin AZ[{az_lo:.0f}–{az_hi:.0f})°, EL[{el_lo:.0f}–{el_hi:.0f})°\n"
+                f"Count: 0"
+            )
+            return
+
+        # Count by code
+        code_counts = in_bin["code"].value_counts().to_dict()
+        code_summary = ", ".join([f"{k}:{v}" for k, v in sorted(code_counts.items(), key=lambda kv: (-kv[1], kv[0]))])
+
+        # Show a small sample of messages
+        sample_n = 5
+        samples = in_bin.sort_values("Time_event")[["Time_event", "code", "msg"]].head(sample_n)
+        sample_lines = "\n".join([f"- {t} | {c} | {msg[:80]}" for t, c, msg in samples.to_records(index=False)])
+
+        more = "" if len(in_bin) <= sample_n else f"\n(+{len(in_bin)-sample_n} more)"
+
+        self.details_var.set(
+            f"Bin AZ[{az_lo:.0f}–{az_hi:.0f})°, EL[{el_lo:.0f}–{el_hi:.0f})°\n"
+            f"Count: {count}\n"
+            f"Codes: {code_summary}\n"
+            f"Sample:\n{sample_lines}{more}"
         )
 
     # -------- Export --------
